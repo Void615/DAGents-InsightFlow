@@ -1,5 +1,20 @@
+# MacOS tmp file
+.DS_Store
+
 # env
 *.env
+
+# test
+*.pytest_cache
+
+# claude
+.claude
+CLAUDE.md
+
+# personal 
+notice.md
+CLAUDE.md
+AGENTS.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
