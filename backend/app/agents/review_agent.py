@@ -47,7 +47,6 @@ class ReviewAgent(BaseAgent):
                 REVIEW_SYSTEM_PROMPT,
                 {
                     "config": state.get("config"),
-                    # 只传各产品的来源数量摘要，不传完整来源内容以控制 token
                     "raw_data_summary": {
                         product: len(items)
                         for product, items in (state.get("raw_data") or {}).items()
@@ -80,23 +79,39 @@ class ReviewAgent(BaseAgent):
             "specific_issues": review.specific_issues,
         }, workflow_id)
 
-        # 不通过且有明确回退目标时，额外广播 REROUTE 事件供前端展示重试路径
-        if not review.passed and review.target_node:
-            await self.log_and_broadcast(event_logger, EventType.REVIEW_REROUTE, {
-                "target_node": review.target_node,
-                "revision_count": state.get("revision_count", 0) + 1,
-                "feedback": review.feedback,
-            }, workflow_id)
-
         await self.log_and_broadcast(event_logger, EventType.NODE_COMPLETE, {
             "output_summary": {"passed": review.passed, "score": review.score},
             "duration_ms": duration_ms,
         }, workflow_id)
 
+        if not review.passed:
+            revision_count = state.get("revision_count", 0)
+            max_revisions = state.get("max_revisions", 3)
+            if revision_count >= max_revisions:
+                return {
+                    "review_result": review.model_dump(mode="json"),
+                    "current_phase": "reviewing",
+                }
+            return {
+                "__pause__": True,
+                "pause_reason": review.feedback or f"报告评分 {review.score}，未通过质检",
+                "pause_options": [
+                    {"value": "retry", "label": "按建议重试", "target_node": review.target_node or "analysis"},
+                    {"value": "approve", "label": "强制通过（接受当前报告）"},
+                    {"value": "abort", "label": "放弃本次分析"},
+                ],
+                "pause_context": {
+                    "score": review.score,
+                    "checks": [c.model_dump(mode="json") for c in review.checks],
+                    "specific_issues": review.specific_issues,
+                    "target_node": review.target_node,
+                },
+                "review_result": review.model_dump(mode="json"),
+                "current_phase": "reviewing",
+            }
+
         return {
             "review_result": review.model_dump(mode="json"),
-            # 通过时不增加 revision_count，避免无意义累加
-            "revision_count": state.get("revision_count", 0) + (0 if review.passed else 1),
             "current_phase": "reviewing",
         }
 

@@ -1,11 +1,17 @@
+import asyncio
 import logging
+import platform
 from contextlib import asynccontextmanager
+
+if platform.system() == "Windows":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.api.v1.router import v1_router
 from app.db.base import Base
 from app.db.session import engine
+from app.core.checkpointer import init_checkpointer, shutdown_checkpointer
 from app.exceptions import AppException
 import app.db.models  # noqa: F401 — 确保所有 ORM 模型在 create_all 前注册
 
@@ -16,7 +22,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await init_checkpointer()
     yield
+    await shutdown_checkpointer()
     await engine.dispose()
 
 

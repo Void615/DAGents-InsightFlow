@@ -5,6 +5,7 @@ langgraph stategraph building and dynamic DAG routing.
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres import PostgresSaver
 from app.schemas.workflow_state import WorkflowState
 from app.services.event_service import EventLogger
 from app.core.graph_nodes import (
@@ -16,7 +17,15 @@ from app.core.graph_nodes import (
 
 
 def _review_router(state: dict) -> str:
-    """审查节点后的条件路由：通过则结束，未通过且在重试上限内则回退到指定节点重做。"""
+    """审查节点后的条件路由。
+
+    优先级：
+      1. 通过 → END
+      2. revision_count >= max_revisions → END（强制终止）
+      3. 未通过：人工决策已在 state 中 → 使用 human 选择的 target_node
+      4. 未通过：无人决策 → 返回 "pause"（由 _execute_node 的 interrupt() 处理）
+      实际到达此函数时，暂停路径已被 interrupt() 拦截，此处只处理正常路由。
+    """
     review = state.get("review_result")
     if review is None:
         return "done"
@@ -30,6 +39,13 @@ def _review_router(state: dict) -> str:
     if revision_count >= max_revisions:
         return "done"
 
+    # 人工决策优先于 agent 的建议 target_node
+    human_decision = state.get("human_decision") or {}
+    if human_decision.get("action") in ("resume", "jump"):
+        target = human_decision.get("target_node")
+        if target in ("information_collection", "analysis", "report_writing"):
+            return target
+
     target = review.get("target_node", "analysis") if isinstance(review, dict) else "analysis"
     if target in ("information_collection", "analysis", "report_writing"):
         return target
@@ -41,6 +57,7 @@ def compile_workflow_graph(
     workflow_id: uuid.UUID,
     event_logger: EventLogger,
     execution_attempt: int,
+    checkpointer: PostgresSaver | None = None,
 ):
     """编译 LangGraph StateGraph。
 
@@ -49,6 +66,9 @@ def compile_workflow_graph(
                                                           │
                                           (不通过, revision < max) ───→ analysis (或指定节点)
                                           (通过 或 revision >= max) ──→ END
+
+    checkpointer: 传入 PostgreSQL checkpointer 时，LangGraph 自动在每个节点
+                  后保存状态快照，支持 interrupt/resume 和 time-travel。
     """
     graph = StateGraph(WorkflowState)
 
@@ -74,4 +94,4 @@ def compile_workflow_graph(
         },
     )
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

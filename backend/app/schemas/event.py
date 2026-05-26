@@ -20,6 +20,7 @@ class EventType(str, Enum):
     WORKFLOW_COMPLETE = "workflow_complete"
     WORKFLOW_FAILED = "workflow_failed"
     WORKFLOW_PAUSED = "workflow_paused"
+    WORKFLOW_RESUMED = "workflow_resumed"
     CONTEXT_COMPRESSED = "context_compressed"
 
 

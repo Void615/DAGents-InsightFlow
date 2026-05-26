@@ -5,7 +5,9 @@ behavior definitions of nodes.
 import json
 import uuid
 import time
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
+from langgraph.types import interrupt
 from app.agents.collection_agent import CollectionAgent
 from app.agents.analysis_agent import AnalysisAgent
 from app.agents.report_agent import ReportAgent
@@ -124,6 +126,29 @@ async def _execute_node(
             is_error=True, error_message=err_msg,
         )
         raise
+
+    # 检测人在回路暂停信号：agent 返回 __pause__ 且 state 中尚无 human_decision
+    # 时暂停 DAG；若已有 human_decision（从 Command(update=...) 注入），则跳过
+    # 暂停直接继续——这是从 checkpoint 恢复后的第二次执行。
+    if result.get("__pause__"):
+        business_result = {k: v for k, v in result.items() if not k.startswith("__")}
+        if not state.get("human_decision"):
+            pause_data = {
+                "paused_by_node": node_name,
+                "dag_state": _sanitize_for_json({**state, **business_result}),
+                "pause_reason": result.get("pause_reason", ""),
+                "pause_options": result.get("pause_options", []),
+                "pause_context": result.get("pause_context", {}),
+                "paused_at": datetime.now(timezone.utc).isoformat(),
+            }
+            interrupt(pause_data)
+        # 恢复路径：human_decision 已注入，interrupt() 返回决策值，合并到 result
+        result = {
+            **business_result,
+            "human_decision": state.get("human_decision", {}),
+            "revision_count": state.get("revision_count", 0) + 1,
+        }
+
     duration_ms = int((time.time() - start) * 1000)
     merged = {**state, **result}
     await _save_node_state(db, workflow_id, execution_attempt, node_name,

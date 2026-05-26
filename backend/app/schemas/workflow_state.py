@@ -30,3 +30,4 @@ class WorkflowState(TypedDict, total=False):
     current_phase: str
     workflow_status: str
     errors: list[ErrorRecord]
+    human_decision: dict
