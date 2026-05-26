@@ -1,7 +1,7 @@
 import time
 import uuid
 from app.agents.base_agent import BaseAgent
-from app.agents.agent_utils import invoke_json_model, llm_is_configured, raw_data_to_context
+from app.agents.agent_utils import llm_is_configured, raw_data_to_context
 from app.services.event_service import EventLogger
 from app.schemas.event import EventType
 from app.schemas.feature import FeatureMatrix
@@ -12,16 +12,24 @@ from pydantic import BaseModel
 
 
 class AnalysisBundle(BaseModel):
+    """LLM 一次调用返回的完整分析产物集合。
+
+    用单个 schema 包裹避免四次独立 LLM 调用，减少延迟和 token 消耗。
+    迁移到 function calling 后，可改为四个独立 tool call 在一次请求内并行返回。
+    """
     feature_matrix: FeatureMatrix
     pricing_comparison: PricingComparison
     user_sentiment: UserSentimentAnalysis
     swot: SWOTAnalysis
 
 
+# 手写 JSON schema 嵌入 system prompt 是临时方案。
+# 迁移到 with_structured_output / function calling 后，schema 由 Pydantic model
+# 自动生成，这段手写 schema 文本即可删除。
 ANALYSIS_SYSTEM_PROMPT = """你是资深竞品分析师。请只基于用户提供的搜索来源上下文生成结构化竞品分析。
 要求：
 - 只输出一个合法 JSON 对象，不要 Markdown，不要解释。
-- 不要编造具体价格、功能或评价；来源不足时写“公开来源不足”或“未在来源中确认”。
+- 不要编造具体价格、功能或评价；来源不足时写"公开来源不足"或"未在来源中确认"。
 - feature_matrix.dimensions 应覆盖用户关注维度，matrix 中每项 products 要包含目标产品和所有竞品。
 - pricing_comparison.plans[].tiers[].price 必须是数字；无法确认具体价格时填 0，并在 highlights 说明未确认。
 - user_sentiment.per_product 的 positive/negative/neutral 用整数估计来源倾向，来源不足时 neutral 至少为 1。
@@ -39,7 +47,11 @@ class AnalysisAgent(BaseAgent):
     node_name = "analysis"
 
     async def run(self, state: dict, event_logger: EventLogger, workflow_id: uuid.UUID) -> dict:
-        """Turn collected raw data into structured competitive analysis."""
+        """将采集阶段产出的原始搜索结果转为结构化竞品分析。
+
+        LLM 可用时：调用 invoke_llm（流式 + 结构化解码），一次返回四大分析产物。
+        LLM 不可用时：走 _fallback_analysis 用规则拼装占位数据，保证工作流不中断。
+        """
         config = state.get("config", {})
         if not isinstance(config, dict):
             config = {}
@@ -61,11 +73,7 @@ class AnalysisAgent(BaseAgent):
         start = time.time()
 
         if llm_is_configured() and raw_data:
-            await self.log_and_broadcast(event_logger, EventType.LLM_REQUEST, {
-                "model_task": "competitive_analysis",
-                "products": products,
-            }, workflow_id)
-            bundle = await invoke_json_model(
+            bundle = await self.invoke_llm(
                 ANALYSIS_SYSTEM_PROMPT,
                 {
                     "target_product": target,
@@ -75,7 +83,10 @@ class AnalysisAgent(BaseAgent):
                     "sources_by_product": raw_data_to_context(raw_data),
                 },
                 AnalysisBundle,
+                event_logger, workflow_id, "competitive_analysis",
+                request_meta={"products": products},
             )
+            # LLM_RESPONSE 仍由 agent 自行记录，携带分析特有的摘要字段
             await self.log_and_broadcast(event_logger, EventType.LLM_RESPONSE, {
                 "model_task": "competitive_analysis",
                 "feature_items": len(bundle.feature_matrix.matrix),
@@ -115,6 +126,11 @@ class AnalysisAgent(BaseAgent):
         focus_dimensions: list[str],
         raw_data: dict,
     ) -> tuple[FeatureMatrix, PricingComparison, UserSentimentAnalysis, SWOTAnalysis]:
+        """无 LLM 或无搜索来源时的规则兜底：用搜索结果标题拼装最低限度分析产物。
+
+        触发条件：llm_is_configured() 为 False，或 raw_data 为空。
+        产出的内容仅标注来源情况，不做实质性分析结论。
+        """
         products = [p for p in [target, *competitors] if p]
         if not products:
             products = ["目标产品"]
@@ -140,6 +156,7 @@ class AnalysisAgent(BaseAgent):
                 }],
             })
 
+        # neutral 至少为 1，避免 sentiment 全零导致下游消费者误判"无数据"
         per_product = {
             product: {"positive": 0, "negative": 0, "neutral": max(1, len(raw_data.get(product, [])))}
             for product in products
@@ -175,6 +192,7 @@ class AnalysisAgent(BaseAgent):
         )
 
     def _source_based_summary(self, product: str, sources: list) -> str:
+        """用搜索结果标题拼装简短的来源摘要，兜底时替代 LLM 分析结论。"""
         if not sources:
             return "公开来源不足，未确认"
         titles = [item.get("title", "") for item in sources[:2] if isinstance(item, dict)]

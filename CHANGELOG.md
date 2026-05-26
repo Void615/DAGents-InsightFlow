@@ -111,3 +111,38 @@
 
 - **部分 attempt 数据不完整**：DAG 跑到中途崩溃时，已执行节点的事件/产物已持久化（该 attempt 内部不完整），但查询时可通过 `execution_attempt` 过滤。不影响后续 attempt
 - **老 attempt 数据堆积**：无自动清理机制，失败的 attempt 数据永久保留。后续可按需增加 TTL 清理或手动归档
+
+---
+
+## 2026-05-26
+
+### 6. Agent 层 LLM 流式输出与调用模式工程化
+
+原有 `invoke_json_model` 在三个分析 agent（analysis / report / review）中使用 `ainvoke` 一次性获取完整响应，SSE 层只能广播粗粒度的生命周期事件（NODE_START / NODE_COMPLETE / LLM_RESPONSE），前端看不到 LLM 逐 token 生成的实时进度。同时三个 agent 各自重复相同的调用样板代码（LLM_REQUEST 日志 → on_token 闭包 → invoke_json_model）。
+
+#### 修复方案
+
+**流式输出**：`invoke_json_model` 新增可选 `stream_callback` 参数。当传入回调时走 `astream` 逐 chunk 推送 token，否则回退到 `ainvoke`；两种路径最终都经过 `extract_json_object` → Pydantic 校验链。`BaseAgent` 新增 `stream_llm_token` 方法，将 token 以 `LLM_STREAM` 事件类型通过 SSE 广播（不写 DB，避免 token 粒度写入撑爆数据库）。`EventType` 枚举新增 `LLM_STREAM = "llm_stream"`。
+
+**模式提取**：在 `BaseAgent` 中新增泛型方法 `invoke_llm(system_prompt, user_payload, schema, event_logger, workflow_id, model_task, ...)`，封装完整调用链：记录 LLM_REQUEST → 创建内部 `_on_token` 回调（调用 `stream_llm_token`）→ 传入 `invoke_json_model` → 返回 Pydantic 结构化对象。三个 agent 不再直接导入 `invoke_json_model`。
+
+**可读性**：7 个 agent 文件全面补充注释，说明每处非显而易见的 WHY：JSON 提取两阶段策略、AnalysisBundle 单次调用设计、引用构建与 LLM 分离的原因、哨兵 vs 宽松 JSON 匹配的可靠性差异、asyncio.gather 的异常隔离策略、搜索模板按产品类别的差异化设计等。
+
+#### 新增文件
+
+（无）
+
+#### 修改的文件
+
+- `backend/app/schemas/event.py` — `EventType` 新增 `LLM_STREAM = "llm_stream"`
+- `backend/app/agents/agent_utils.py` — `invoke_json_model` 新增可选 `stream_callback` 参数；新增 `StreamCallback` 类型别名；补充核心函数文档注释
+- `backend/app/agents/base_agent.py` — 新增 `stream_llm_token`（SSE 广播 token，不写 DB）和 `invoke_llm`（泛型 LLM 调用封装）两个方法；补充三段式方法分组注释
+- `backend/app/agents/analysis_agent.py` — 移除 `invoke_json_model` 直接导入；LLM 调用改为 `self.invoke_llm(...)`；补充注释
+- `backend/app/agents/report_agent.py` — 同上；补充引用构建与 LLM 分离的设计注释
+- `backend/app/agents/review_agent.py` — 同上；补充规则审查四维度及硬性门槛注释
+- `backend/app/agents/collection_agent.py` — 补充搜索模板设计、并发隔离策略、URL 去重注释
+- `backend/app/agents/interview_agent.py` — 补充架构差异说明（独立于 DAG、哨兵机制）、清理未使用的 `HumanMessage` 导入
+
+#### 可能的潜在问题
+
+- **JSON 提取仍依赖 prompt engineering**：当前 LLM 通过系统提示中的手写 JSON schema 文本输出自由格式 JSON，再由 regex 提取、Pydantic 校验。schema 变更需同时修改系统提示和 Pydantic model，容易不同步。代码中已标注迁移路径：后续替换为 `with_structured_output()` / function calling，届时 `extract_json_object` 和系统提示中的手写 schema 即可删除
