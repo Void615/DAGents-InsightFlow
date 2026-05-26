@@ -1,3 +1,6 @@
+# VSCode setting file
+.vscode
+
 # MacOS tmp file
 .DS_Store
 
@@ -15,6 +18,7 @@ CLAUDE.md
 notice.md
 CLAUDE.md
 AGENTS.md
+ISSUES.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

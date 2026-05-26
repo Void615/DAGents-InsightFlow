@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_async_session
 from app.dependencies import get_current_user
 from app.schemas.auth import UserResponse
+from app.schemas.workflow import WorkflowCreate
 from app.db.queries.workflow_queries import get_workflow_by_id, get_user_workflows
 from app.services.workflow_service import create_workflow, start_workflow, cancel_workflow, delete_workflow
 from app.core.workflow_executor import run_workflow
@@ -14,11 +15,11 @@ router = APIRouter(prefix="/workflows", tags=["workflows"])
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_new_workflow(
-    title: str,
+    body: WorkflowCreate,
     current_user: UserResponse = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_session)
 ):
-    workflow = await create_workflow(db, current_user.id, title)
+    workflow = await create_workflow(db, current_user.id, body.title)
     return {"workflow_id": str(workflow.id), "title": workflow.title, "status": workflow.status}
 
 
@@ -97,6 +98,7 @@ async def retry_node_endpoint(
         raise InvalidStateTransitionError(workflow_id, workflow.status, "retry")
     workflow.status = "running"
     workflow.error_message = None
+    workflow.execution_attempt += 1
     await db.commit()
     background_tasks.add_task(run_workflow, workflow.id)
-    return {"workflow_id": str(workflow.id), "status": "running", "retry_node": node_name}
+    return {"workflow_id": str(workflow.id), "status": "running", "execution_attempt": workflow.execution_attempt, "retry_node": node_name}
