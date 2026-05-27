@@ -31,3 +31,4 @@ class WorkflowState(TypedDict, total=False):
     workflow_status: str
     errors: list[ErrorRecord]
     human_decision: dict
+    cached_review_result: Optional[dict]

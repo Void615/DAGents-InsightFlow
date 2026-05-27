@@ -175,8 +175,7 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
         checkpointer = await get_checkpointer()
 
         workflow.status = "running"
-        # 递增 revision_count，与旧 review agent 行为一致
-        if decision.action == "resume" or decision.action == "jump":
+        if decision.action == "jump":
             workflow.pause_state = None
         await db.commit()
 
@@ -202,10 +201,40 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
             )
             config = {"configurable": {"thread_id": str(workflow_id)}}
 
+            # 从 pause_state 提取缓存的 review_result，避免 resume 时重复 LLM 调用
+            dag_state = (workflow.pause_state or {}).get("dag_state", {})
+            cached_review_result = dag_state.get("review_result") if decision.action == "jump" else None
+
+            # 发出通用 REROUTE 事件
+            if decision.action == "jump":
+                target = decision.target_node or (
+                    cached_review_result.get("target_node") if cached_review_result else None
+                )
+                if target:
+                    await event_logger.log(
+                        event_type=EventType.REROUTE,
+                        payload={
+                            "from_node": (workflow.pause_state or {}).get("paused_by_node"),
+                            "to_node": target,
+                            "trigger": "human_jump" if decision.target_node else "agent_suggestion",
+                            "feedback": decision.feedback,
+                        },
+                        node_name="__workflow__",
+                    )
+                    await sse_manager.broadcast(workflow_id, {
+                        "event_type": EventType.REROUTE.value,
+                        "from_node": (workflow.pause_state or {}).get("paused_by_node"),
+                        "to_node": target,
+                        "trigger": "human_jump" if decision.target_node else "agent_suggestion",
+                    })
+
             final_state = await compiled_graph.ainvoke(
                 Command(
                     resume=decision.model_dump(mode="json"),
-                    update={"human_decision": decision.model_dump(mode="json")},
+                    update={
+                        "human_decision": decision.model_dump(mode="json"),
+                        "cached_review_result": cached_review_result,
+                    },
                 ),
                 config,
             )

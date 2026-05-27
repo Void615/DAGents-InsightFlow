@@ -187,3 +187,36 @@
 - **interrupt() 后节点重新执行**：LangGraph 从 checkpoint 恢复时会重新执行整个节点函数。通过 `human_decision` 注入 state 并检查 `state.get("human_decision")` 来跳过二次暂停，但 agent 的 LLM 调用也会重新执行，带来额外的 token 开销。后续可考虑通过 `_execute_node` 的快速路径优化，在有 `human_decision` 时跳过 agent 调用直接返回缓存结果。
 - **checkpointer 表与业务表不在同一事务**：`checkpoints`/`checkpoint_blobs`/`checkpoint_writes` 三张表由 LangGraph checkpointer 独立管理（通过 psycopg 连接池），与 SQLAlchemy 管理的业务表不在同一事务边界。极端情况下可能出现业务表标记为 paused 但 checkpoint 未保存（或反之），导致 resume 时状态不一致。当前通过先保存 checkpoint（interrupt 内部），再提交业务事务来降低风险，但无法完全消除。
 - **并发恢复风险**：当前未对 `workflow.status` 加乐观锁或分布式锁，理论上可能有两个并发 `POST /decide` 同时触发 resume。后续可增加 `status` 字段的 CAS 检查或引入 Redis 分布式锁。
+
+---
+
+## 2026-05-27
+
+### 8. 通用化人在回路 Jump 机制与 Resume 优化
+
+原有 pause→resume 机制存在三个问题：(1) `resume` 和 `jump` 语义完全重叠，`resume` 没有独立价值；(2) `_review_router` 混杂了 review 特有判断（passed、max_revisions），无法用于其他节点的暂停后跳转；(3) resume 时 ReviewAgent 用相同 state 重新跑一遍 LLM，浪费 token 调用。
+
+#### 修复方案
+
+- **删除 `resume`，统一为 `jump`**：`DecisionAction` 枚举移除 `RESUME`，只保留 `JUMP`/`APPROVE`/`ABORT`。人工 `target_node` 始终优先于 agent 建议
+- **Router 通用化**：`_review_router` → 工厂函数 `make_pause_router(default_next)`，不再检查 `passed` 或 `revision_count >= max_revisions`。这些控制权归还给 agent 自身——通过是否设置 `target_node` 来决定是否触发 reroute。新路由逻辑：人工 jump + 有效 target_node → agent 建议 target_node → `default_next`（正常流程）。所有四个 DAG 节点均使用条件边（`add_conditional_edges`），任意节点返回 `__pause__` 后均可跳转到 reroute 目标，不再只有 review 节点支持
+- **Resume 跳过重复 LLM 调用**：`resume_workflow` 从 `workflow.pause_state.dag_state` 中提取缓存的 `review_result`，通过 `Command(update={"cached_review_result": ...})` 注入 state。`make_review_node` 检测到 `human_decision` + `cached_review_result` 同时存在时，直接返回缓存结果并递增 `revision_count`，完全跳过 `ReviewAgent.run()` 和 `_execute_node`
+- **事件补全**：`REVIEW_REROUTE` → 通用 `REROUTE`（任何节点暂停后的跳转）；新增 `REVIEW_FAILED_MAX_REVISIONS`（修订次数达上限）；`approve` 路径补发 `WORKFLOW_COMPLETE` + SSE；`abort` 路径补发 `WORKFLOW_FAILED`（error_code=USER_ABORTED）+ SSE
+- **pause_options 更新**：`retry` → `jump`，与 API action 名称一致
+
+#### 修改的文件
+
+- `backend/app/schemas/decision.py` — 删除 `DecisionAction.RESUME`；更新 `target_node` 字段描述
+- `backend/app/schemas/event.py` — `REVIEW_REROUTE` → `REROUTE`；新增 `REVIEW_FAILED_MAX_REVISIONS`
+- `backend/app/schemas/workflow_state.py` — 新增 `cached_review_result: Optional[dict]` 字段
+- `backend/app/core/orchestrator.py` — `_review_router` → `make_pause_router(default_next)` 工厂函数；抽取 `REROUTE_TARGETS` 常量；三处 `add_edge` 硬边替换为 `add_conditional_edges`，所有节点均可暂停后跳转
+- `backend/app/agents/review_agent.py` — max_revisions 时发出 `REVIEW_FAILED_MAX_REVISIONS` 事件；`pause_options` 中 `retry` → `jump`
+- `backend/app/core/graph_nodes.py` — `make_review_node`：检测 `cached_review_result` 时跳过 agent 重跑，直接返回缓存结果
+- `backend/app/core/workflow_executor.py` — `resume_workflow`：提取缓存 `review_result` 注入 `Command.update`；发出通用 `REROUTE` 事件；删除 `resume` 动作判断
+- `backend/app/api/v1/workflow.py` — `approve`/`abort` 补全 `EventLogger` + SSE 广播；删除 `resume` 分支；`jump` 改为唯一的 DAG 恢复动作
+- `backend/tests/test_human_in_the_loop.py` — 类名 `TestReviewRouter` → `TestPauseRouter`；`_pause_router` → `make_pause_router("done")`；新增 5 个测试（cached_review_result 跳过、max_revisions 事件、approve/abort SSE）；delete 基于 `RESUME` 的测试用例
+
+#### 可能的潜在问题
+
+- **缓存仅覆盖 review 节点**：当前 `cached_review_result` 机制专门针对 review 节点的 LLM 跳过。若未来其他节点（如 analysis、report）也加入 `__pause__` 并在 resume 时需要跳过重复 LLM 调用，需要为该节点添加类似的缓存 key 和跳过逻辑
+- **Router 依赖 agent 配合**：`_pause_router` 的 fallback 分支（agent 建议 target_node）当前只检查 `state["review_result"]`。若未来其他 agent 也需要建议 target_node，需在 router 中增加对应的 state key 检查，或建立统一的 state 字段约定
