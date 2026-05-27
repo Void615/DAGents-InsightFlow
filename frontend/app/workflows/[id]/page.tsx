@@ -133,11 +133,12 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
             competitors: [...new Set([...(prev.competitors ?? []), ...incoming.suggested_competitors!])],
           }));
         }
-        if (incoming.is_complete) {
+        if (incoming.is_complete && incoming.extracted_config) {
           setIsComplete(true);
         }
       },
-      () => setIsComplete(true),
+      // onComplete: only lock when META says complete AND config was extracted
+      () => {},
       (err) => console.error("Interview SSE error:", err)
     );
   };
@@ -261,6 +262,57 @@ function DagRuntimeView({ workflowId, token }: { workflowId: string; token: stri
       return next;
     });
   }, []);
+
+  // Replay historical events on mount (for page revisit)
+  useEffect(() => {
+    const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+    fetch(`${baseUrl}/workflows/${workflowId}/events`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then((history: WorkflowEvent[]) => {
+        if (!Array.isArray(history)) return;
+        // Sort by seq to replay in order
+        const sorted = [...history].sort((a, b) => a.seq - b.seq);
+        setEvents(sorted);
+        // Rebuild node states from history
+        setNodeStates(() => {
+          const rebuilt: Record<AgentNodeName, { status: NodeStatus; message?: string; duration_ms?: number }> = {
+            information_collection: { status: "idle" },
+            analysis: { status: "idle" },
+            report_writing: { status: "idle" },
+            review: { status: "idle" },
+          };
+          let reroute = false;
+          for (const e of sorted) {
+            const node = e.node_name as AgentNodeName;
+            if (!node) continue;
+            const payload = e.payload as Record<string, unknown> | undefined;
+            switch (e.event_type) {
+              case "node_start":
+                rebuilt[node] = { ...rebuilt[node], status: "active", message: "Running..." };
+                break;
+              case "node_complete":
+                rebuilt[node] = { ...rebuilt[node], status: "completed", message: "Completed", duration_ms: payload?.duration_ms as number };
+                break;
+              case "node_error":
+                rebuilt[node] = { ...rebuilt[node], status: "failed", message: (payload?.error_message as string) || "Error" };
+                break;
+              case "review_reroute":
+                rebuilt.review = { ...rebuilt.review, status: "rerouted", message: "Rerouting..." };
+                if (payload?.target_node) {
+                  rebuilt[payload.target_node as AgentNodeName] = { ...rebuilt[payload.target_node as AgentNodeName], status: "idle" };
+                }
+                reroute = true;
+                break;
+            }
+          }
+          setHasReroute(reroute);
+          return rebuilt;
+        });
+      })
+      .catch(() => {});
+  }, [workflowId, token]);
 
   useWorkflowStream({
     workflowId,
