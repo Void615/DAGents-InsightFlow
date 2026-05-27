@@ -23,6 +23,18 @@ async def _noop_rate_limit():
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
+_shared_engine = None
+
+
+def _get_shared_engine():
+    global _shared_engine
+    if _shared_engine is None:
+        _shared_engine = create_async_engine(
+            TEST_DATABASE_URL,
+            connect_args={"check_same_thread": False},
+        )
+    return _shared_engine
+
 
 @pytest.fixture(scope="session")
 def event_loop():
@@ -33,7 +45,7 @@ def event_loop():
 
 @pytest.fixture(scope="function")
 async def client():
-    engine = create_async_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
+    engine = _get_shared_engine()
     TestingSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with engine.begin() as conn:
@@ -51,4 +63,12 @@ async def client():
         yield ac
 
     app.dependency_overrides.clear()
-    await engine.dispose()
+
+
+@pytest.fixture(scope="function")
+async def db_session():
+    """Direct DB session sharing the same SQLite engine as the client fixture."""
+    engine = _get_shared_engine()
+    TestingSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with TestingSessionLocal() as session:
+        yield session

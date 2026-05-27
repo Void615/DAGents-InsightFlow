@@ -11,6 +11,10 @@ from app.schemas.event import EventType
 from app.schemas.competitor import CompetitorInfo, SearchResult
 
 
+# 不同产品类别的搜索意图不同：
+# - SaaS: 侧重定价页和用户社区（知乎、少数派）
+# - 移动应用: 侧重应用商店评分（Apple Store、酷安）
+# - 硬件: 侧重评测和价格追踪（知乎、什么值得买）
 SEARCH_QUERY_TEMPLATES = {
     "SaaS / 协作工具": [
         "{product} 功能 定价 用户评价",
@@ -31,10 +35,15 @@ SEARCH_QUERY_TEMPLATES = {
 
 
 class CollectionAgent(BaseAgent):
+    """信息采集 Agent：通过 Tavily 搜索 API 并行采集竞品公开信息。
+
+    对每个产品（目标产品 + N 个竞品）并发执行多条搜索查询，
+    按 URL 去重后汇总为 raw_data 传入下游分析节点。
+    """
+
     node_name = "information_collection"
 
     async def run(self, state: dict, event_logger: EventLogger, workflow_id: uuid.UUID) -> dict:
-        """Collect competitive intelligence with Tavily search."""
         config = state.get("config", {})
         if not isinstance(config, dict):
             config = {}
@@ -45,6 +54,7 @@ class CollectionAgent(BaseAgent):
         competitor_names = config.get("competitors", []) or []
         competitor_count = config.get("competitor_count", len(competitor_names) or 5)
         competitor_names = competitor_names[:competitor_count]
+        # 目标产品也参与搜索，确保分析时有自身数据做基线对比
         products = [p for p in [target, *competitor_names] if p]
 
         await self.log_and_broadcast(event_logger, EventType.NODE_START, {
@@ -66,10 +76,12 @@ class CollectionAgent(BaseAgent):
                 collection_errors[product] = "Tavily API key is not configured; skipped live search."
         else:
             client = AsyncTavilyClient(api_key=get_settings().TAVILY_API_KEY)
+            # 所有产品的搜索并发执行，总耗时 = max(单产品耗时) 而非 sum
             tasks = [
                 self._collect_for_product(client, product, category, focus_dimensions, event_logger, workflow_id)
                 for product in products
             ]
+            # gather(return_exceptions=True)：单个产品失败不影响其他产品
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for product, result in zip(products, results):
                 if isinstance(result, Exception):
@@ -107,6 +119,13 @@ class CollectionAgent(BaseAgent):
         event_logger: EventLogger,
         workflow_id: uuid.UUID,
     ) -> list[SearchResult]:
+        """对单个产品执行多查询搜索，URL 去重后返回结果列表。
+
+        搜索策略：
+        1. 从 SEARCH_QUERY_TEMPLATES 取产品类别对应的 3 条模板查询
+        2. 追加一条由用户关注维度拼接的自定义查询
+        3. 每条查询取最多 4 条结果，按 URL 去重
+        """
         templates = SEARCH_QUERY_TEMPLATES.get(category, SEARCH_QUERY_TEMPLATES["SaaS / 协作工具"])
         focus = " ".join(focus_dimensions[:4]) if focus_dimensions else "功能 定价 用户评价 市场定位"
         queries = [template.format(product=product) for template in templates]

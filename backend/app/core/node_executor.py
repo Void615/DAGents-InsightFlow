@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from langgraph.errors import GraphInterrupt
 from app.services.event_service import EventLogger
 from app.schemas.event import EventType
 from app.exceptions import AppException
@@ -43,6 +44,8 @@ async def execute_with_retry(
                 timeout=NODE_TIMEOUT,
             )
             return result
+        except GraphInterrupt:
+            raise
         except Exception as e:
             last_error = e
             logger.warning(f"节点 {node_name} 第 {attempt} 次执行失败: {e}")

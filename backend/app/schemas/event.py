@@ -14,11 +14,13 @@ class EventType(str, Enum):
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     LLM_REQUEST = "llm_request"
+    LLM_STREAM = "llm_stream"
     LLM_RESPONSE = "llm_response"
     WORKFLOW_START = "workflow_start"
     WORKFLOW_COMPLETE = "workflow_complete"
     WORKFLOW_FAILED = "workflow_failed"
     WORKFLOW_PAUSED = "workflow_paused"
+    WORKFLOW_RESUMED = "workflow_resumed"
     CONTEXT_COMPRESSED = "context_compressed"
 
 

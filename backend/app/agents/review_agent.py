@@ -1,7 +1,7 @@
 import time
 import uuid
 from app.agents.base_agent import BaseAgent
-from app.agents.agent_utils import invoke_json_model, llm_is_configured
+from app.agents.agent_utils import llm_is_configured
 from app.services.event_service import EventLogger
 from app.schemas.event import EventType
 from app.schemas.review import ReviewOutput, ReviewCheck
@@ -26,10 +26,16 @@ JSON schema:
 
 
 class ReviewAgent(BaseAgent):
+    """报告质检 Agent。
+
+    审查维度：完整性、证据、分析结构、一致性。
+    不通过时通过 target_node 指定回退目标节点，由 orchestrator 的条件路由决定
+    是重做采集/分析/报告，还是超出重试上限后强制结束。
+    """
+
     node_name = "review"
 
     async def run(self, state: dict, event_logger: EventLogger, workflow_id: uuid.UUID) -> dict:
-        """Review report quality and decide whether to reroute."""
         await self.log_and_broadcast(event_logger, EventType.NODE_START, {
             "input_summary": {"phase": "reviewing"},
         }, workflow_id)
@@ -37,10 +43,7 @@ class ReviewAgent(BaseAgent):
         start = time.time()
 
         if llm_is_configured():
-            await self.log_and_broadcast(event_logger, EventType.LLM_REQUEST, {
-                "model_task": "report_review",
-            }, workflow_id)
-            review = await invoke_json_model(
+            review = await self.invoke_llm(
                 REVIEW_SYSTEM_PROMPT,
                 {
                     "config": state.get("config"),
@@ -55,6 +58,7 @@ class ReviewAgent(BaseAgent):
                     "report": state.get("report"),
                 },
                 ReviewOutput,
+                event_logger, workflow_id, "report_review",
             )
             await self.log_and_broadcast(event_logger, EventType.LLM_RESPONSE, {
                 "model_task": "report_review",
@@ -75,25 +79,54 @@ class ReviewAgent(BaseAgent):
             "specific_issues": review.specific_issues,
         }, workflow_id)
 
-        if not review.passed and review.target_node:
-            await self.log_and_broadcast(event_logger, EventType.REVIEW_REROUTE, {
-                "target_node": review.target_node,
-                "revision_count": state.get("revision_count", 0) + 1,
-                "feedback": review.feedback,
-            }, workflow_id)
-
         await self.log_and_broadcast(event_logger, EventType.NODE_COMPLETE, {
             "output_summary": {"passed": review.passed, "score": review.score},
             "duration_ms": duration_ms,
         }, workflow_id)
 
+        if not review.passed:
+            revision_count = state.get("revision_count", 0)
+            max_revisions = state.get("max_revisions", 3)
+            if revision_count >= max_revisions:
+                return {
+                    "review_result": review.model_dump(mode="json"),
+                    "current_phase": "reviewing",
+                }
+            return {
+                "__pause__": True,
+                "pause_reason": review.feedback or f"报告评分 {review.score}，未通过质检",
+                "pause_options": [
+                    {"value": "retry", "label": "按建议重试", "target_node": review.target_node or "analysis"},
+                    {"value": "approve", "label": "强制通过（接受当前报告）"},
+                    {"value": "abort", "label": "放弃本次分析"},
+                ],
+                "pause_context": {
+                    "score": review.score,
+                    "checks": [c.model_dump(mode="json") for c in review.checks],
+                    "specific_issues": review.specific_issues,
+                    "target_node": review.target_node,
+                },
+                "review_result": review.model_dump(mode="json"),
+                "current_phase": "reviewing",
+            }
+
         return {
             "review_result": review.model_dump(mode="json"),
-            "revision_count": state.get("revision_count", 0) + (0 if review.passed else 1),
             "current_phase": "reviewing",
         }
 
     def _rule_based_review(self, state: dict) -> ReviewOutput:
+        """无 LLM 时的规则审查：基于结构完整性做简单打分。
+
+        四个检查项：
+        - completeness:     报告正文 >= 500 字且 >= 4 个章节
+        - evidence:         有搜索来源且有引用
+        - analysis_structure: 四个分析产物均非空
+        - consistency:      标题和摘要存在
+
+        passed 需要 score >= 70 且 evidence 必须通过。
+        回退优先级：来源不足 → 重采集；分析缺失 → 重分析；其余 → 重报告。
+        """
         report = state.get("report") or {}
         raw_data = state.get("raw_data") or {}
         feature_matrix = state.get("feature_matrix") or {}
@@ -130,6 +163,7 @@ class ReviewAgent(BaseAgent):
 
         passed_count = sum(1 for check in checks if check.passed)
         score = round(passed_count / len(checks) * 100, 1)
+        # evidence 是硬性要求：无来源的报告即使其他项全过也不通过
         evidence_ok = checks[1].passed
         passed = score >= 70 and evidence_ok
         target_node = None

@@ -295,3 +295,125 @@ cd backend
 pip install pytest pytest-asyncio httpx aiosqlite
 python -m pytest -v
 ```
+
+## 数据库表结构
+
+### user — 用户账户
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | UUID | PK | 用户唯一标识 |
+| `username` | VARCHAR(64) | UNIQUE, NOT NULL | 用户名 |
+| `email` | VARCHAR(255) | UNIQUE, NOT NULL | 邮箱 |
+| `hashed_password` | VARCHAR(255) | NOT NULL | bcrypt 哈希密码 |
+| `display_name` | VARCHAR(128) | NULL | 显示名称 |
+| `is_active` | BOOLEAN | NOT NULL, DEFAULT TRUE | 账户是否启用 |
+| `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |
+| `updated_at` | TIMESTAMPTZ | NOT NULL | 更新时间（自动更新） |
+
+### workflow — 工作流聚合根
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | UUID | PK | 工作流唯一标识 |
+| `owner_id` | UUID | FK → user.id CASCADE, NOT NULL | 创建者 |
+| `title` | VARCHAR(255) | NOT NULL | 工作流标题 |
+| `status` | VARCHAR(32) | NOT NULL, DEFAULT 'created' | 状态：created / configuring / running / paused / completed / failed / cancelled |
+| `current_phase` | VARCHAR(32) | NULL | 当前 DAG 阶段：collecting / analyzing / reporting / reviewing / done |
+| `config` | JSON | NOT NULL, DEFAULT '{}' | 工作流配置（目标产品、竞品列表、分析维度等） |
+| `revision_count` | INTEGER | NOT NULL, DEFAULT 0 | 当前修订轮次 |
+| `max_revisions` | INTEGER | NOT NULL, DEFAULT 3 | 最大修订次数 |
+| `total_tokens` | INTEGER | NOT NULL, DEFAULT 0 | 累计 LLM token 消耗 |
+| `langgraph_checkpoint_id` | VARCHAR(128) | NULL | LangGraph checkpoint 引用 |
+| `error_message` | TEXT | NULL | 失败时的错误信息 |
+| `pause_state` | JSON | NULL | 暂停元数据（reason / options / paused_by_node / paused_at），checkpoint 负责 DAG state |
+| `execution_attempt` | INTEGER | NOT NULL, DEFAULT 1 | 执行批次号，每次 retry 递增 |
+| `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |
+| `updated_at` | TIMESTAMPTZ | NOT NULL | 更新时间（自动更新） |
+| `completed_at` | TIMESTAMPTZ | NULL | 完成时间 |
+
+### interview_message — 访谈消息历史
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | UUID | PK | 消息唯一标识 |
+| `workflow_id` | UUID | FK → workflow.id CASCADE, NOT NULL | 所属工作流 |
+| `role` | VARCHAR(16) | NOT NULL | 角色：user / assistant |
+| `content` | TEXT | NOT NULL | 消息内容 |
+| `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |
+
+### workflow_event — 事件日志
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | UUID | PK | 事件唯一标识 |
+| `workflow_id` | UUID | FK → workflow.id CASCADE, NOT NULL | 所属工作流 |
+| `node_name` | VARCHAR(64) | NOT NULL | 产生事件的节点名 |
+| `iteration` | INTEGER | NOT NULL, DEFAULT 0 | 节点迭代轮次 |
+| `event_type` | VARCHAR(32) | NOT NULL | 事件类型（见 EventType 枚举） |
+| `seq` | INTEGER | NOT NULL | 工作流内单调递增序列号 |
+| `execution_attempt` | INTEGER | NOT NULL, DEFAULT 1 | 执行批次号 |
+| `payload` | JSON | NOT NULL, DEFAULT '{}' | 事件负载数据 |
+| `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |
+
+### workflow_node_state — 节点执行快照
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | UUID | PK | 快照唯一标识 |
+| `workflow_id` | UUID | FK → workflow.id CASCADE, NOT NULL | 所属工作流 |
+| `node_name` | VARCHAR(64) | NOT NULL | 节点名 |
+| `iteration` | INTEGER | NOT NULL, DEFAULT 0 | 节点迭代轮次 |
+| `state_snapshot` | JSON | NOT NULL, DEFAULT '{}' | 执行后完整 WorkflowState 快照 |
+| `artifact_ids` | JSON | NOT NULL, DEFAULT '[]' | 本次产生的产物 ID 列表 |
+| `tokens_input` | INTEGER | NOT NULL, DEFAULT 0 | LLM 输入 token 数 |
+| `tokens_output` | INTEGER | NOT NULL, DEFAULT 0 | LLM 输出 token 数 |
+| `duration_ms` | INTEGER | NOT NULL, DEFAULT 0 | 执行耗时（毫秒） |
+| `model_name` | VARCHAR(64) | NULL | 使用的 LLM 模型名 |
+| `is_error` | BOOLEAN | NOT NULL, DEFAULT FALSE | 是否为错误快照 |
+| `error_message` | TEXT | NULL | 错误信息 |
+| `execution_attempt` | INTEGER | NOT NULL, DEFAULT 1 | 执行批次号 |
+| `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |
+
+### artifact — 工作流产物
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | UUID | PK | 产物唯一标识 |
+| `workflow_id` | UUID | FK → workflow.id CASCADE, NOT NULL | 所属工作流 |
+| `artifact_type` | VARCHAR(32) | NOT NULL | 产物类型：collection_raw / feature_matrix / pricing_comparison / user_sentiment / swot_analysis / report |
+| `title` | VARCHAR(255) | NOT NULL | 产物标题 |
+| `content` | JSON | NOT NULL, DEFAULT '{}' | 结构化产物内容 |
+| `content_text` | TEXT | NULL | 纯文本 / Markdown 内容（用于全文检索和下载） |
+| `format_version` | VARCHAR(16) | NOT NULL, DEFAULT '1.0' | 内容格式版本 |
+| `created_by_node` | VARCHAR(64) | NULL | 创建该产物的节点名 |
+| `execution_attempt` | INTEGER | NOT NULL, DEFAULT 1 | 执行批次号 |
+| `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |
+| `updated_at` | TIMESTAMPTZ | NOT NULL | 更新时间（自动更新） |
+
+### trace_link — 溯源链接
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | UUID | PK | 溯源链接唯一标识 |
+| `artifact_id` | UUID | FK → artifact.id CASCADE, NOT NULL | 所属产物 |
+| `section_path` | VARCHAR(255) | NULL | 报告中的章节路径 |
+| `claim_text` | TEXT | NULL | 被溯源的声明文本 |
+| `source_url` | TEXT | NOT NULL | 来源 URL |
+| `source_title` | VARCHAR(512) | NULL | 来源标题 |
+| `source_snippet` | TEXT | NULL | 来源摘要片段 |
+| `source_type` | VARCHAR(32) | NOT NULL, DEFAULT 'web' | 来源类型 |
+| `retrieved_at` | TIMESTAMPTZ | NOT NULL | 来源检索时间 |
+| `confidence` | FLOAT | NULL | 置信度评分 |
+| `is_verified` | BOOLEAN | NOT NULL, DEFAULT FALSE | 是否人工验证 |
+| `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |
+
+### search_template — 搜索模板
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `id` | UUID | PK | 模板唯一标识 |
+| `category` | VARCHAR(64) | UNIQUE, NOT NULL | 产品类别 |
+| `templates` | JSON | NOT NULL, DEFAULT '{}' | 搜索模板配置 |
+| `description` | VARCHAR(255) | NULL | 模板描述 |
+| `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |

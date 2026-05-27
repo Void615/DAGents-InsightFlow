@@ -4,9 +4,11 @@ from app.db.session import get_async_session
 from app.dependencies import get_current_user
 from app.schemas.auth import UserResponse
 from app.schemas.workflow import WorkflowCreate
+from app.schemas.decision import DecisionRequest
 from app.db.queries.workflow_queries import get_workflow_by_id, get_user_workflows
 from app.services.workflow_service import create_workflow, start_workflow, cancel_workflow, delete_workflow
-from app.core.workflow_executor import run_workflow
+from app.services.sse_service import sse_manager
+from app.core.workflow_executor import run_workflow, resume_workflow
 from app.exceptions import WorkflowNotFoundError, InvalidStateTransitionError
 
 
@@ -51,6 +53,7 @@ async def get_workflow_detail(
         "max_revisions": workflow.max_revisions,
         "total_tokens": workflow.total_tokens,
         "error_message": workflow.error_message,
+        "pause_state": workflow.pause_state,
         "created_at": workflow.created_at,
         "updated_at": workflow.updated_at,
         "completed_at": workflow.completed_at,
@@ -90,15 +93,66 @@ async def retry_node_endpoint(
     current_user: UserResponse = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    """重试失败的工作流。"""
+    """重试失败的工作流，从零开始重新执行。"""
     workflow = await get_workflow_by_id(db, workflow_id, current_user.id)
     if not workflow:
         raise WorkflowNotFoundError(workflow_id)
-    if workflow.status != "failed":
+    if workflow.status not in ("failed", "paused"):
         raise InvalidStateTransitionError(workflow_id, workflow.status, "retry")
     workflow.status = "running"
     workflow.error_message = None
     workflow.execution_attempt += 1
     await db.commit()
     background_tasks.add_task(run_workflow, workflow.id)
-    return {"workflow_id": str(workflow.id), "status": "running", "execution_attempt": workflow.execution_attempt, "retry_node": node_name}
+    return {
+        "workflow_id": str(workflow.id),
+        "status": "running",
+        "execution_attempt": workflow.execution_attempt,
+        "retry_node": node_name,
+    }
+
+
+@router.post("/{workflow_id}/decide")
+async def human_decide(
+    workflow_id: str,
+    decision: DecisionRequest,
+    background_tasks: BackgroundTasks,
+    current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """人在回路决策端点。
+
+    - resume: 从 checkpoint 继续执行（agent 建议的 target_node）
+    - jump:   从 checkpoint 恢复，使用指定的 target_node 重新执行
+    - approve: 强制接受当前结果，标记 completed
+    - abort:   放弃执行，标记 cancelled
+    """
+    workflow = await get_workflow_by_id(db, workflow_id, current_user.id)
+    if not workflow:
+        raise WorkflowNotFoundError(workflow_id)
+    if workflow.status != "paused":
+        raise InvalidStateTransitionError(workflow_id, workflow.status, "decide")
+
+    if decision.action == "approve":
+        workflow.status = "completed"
+        workflow.current_phase = "done"
+        workflow.pause_state = None
+        await db.commit()
+        await sse_manager.close_workflow(workflow.id)
+        return {"workflow_id": str(workflow.id), "status": "completed", "action": "approve"}
+
+    if decision.action == "abort":
+        workflow.status = "cancelled"
+        workflow.pause_state = None
+        await db.commit()
+        await sse_manager.close_workflow(workflow.id)
+        return {"workflow_id": str(workflow.id), "status": "cancelled", "action": "abort"}
+
+    # resume / jump: 启动后台恢复任务
+    background_tasks.add_task(resume_workflow, workflow.id, decision)
+    return {
+        "workflow_id": str(workflow.id),
+        "status": "running",
+        "action": decision.action.value,
+        "target_node": decision.target_node,
+    }
