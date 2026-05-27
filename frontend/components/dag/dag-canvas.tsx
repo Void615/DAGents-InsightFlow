@@ -1,29 +1,18 @@
 "use client";
 
 import { useMemo, useCallback } from "react";
-import {
-  ReactFlow,
-  Background,
-  Controls,
-  type Node,
-  type Edge,
-  MarkerType,
-} from "reactflow";
+import { ReactFlow, Background, Controls, type Node, type Edge, MarkerType } from "reactflow";
 import "reactflow/dist/style.css";
 import { DagNode } from "./dag-node";
 import type { AgentNodeName } from "@/types/event";
 
 const nodeTypes = { dagNode: DagNode };
 
-const NODE_DEFINITIONS: Array<{
-  id: AgentNodeName;
-  label: string;
-  position: { x: number; y: number };
-}> = [
-  { id: "information_collection", label: "CollectionAgent\n信息采集", position: { x: 200, y: 0 } },
-  { id: "analysis", label: "AnalysisAgent\n多维分析", position: { x: 200, y: 140 } },
-  { id: "report_writing", label: "ReportAgent\n报告撰写", position: { x: 200, y: 280 } },
-  { id: "review", label: "ReviewAgent\n质量审查", position: { x: 200, y: 420 } },
+const NODE_DEFINITIONS: Array<{ id: AgentNodeName; label: string; position: { x: number; y: number } }> = [
+  { id: "information_collection", label: "CollectionAgent\n信息采集", position: { x: 160, y: 0 } },
+  { id: "analysis", label: "AnalysisAgent\n多维分析", position: { x: 160, y: 150 } },
+  { id: "report_writing", label: "ReportAgent\n报告撰写", position: { x: 160, y: 300 } },
+  { id: "review", label: "ReviewAgent\n质量审查", position: { x: 160, y: 450 } },
 ];
 
 export type NodeStatus = "idle" | "active" | "completed" | "failed" | "rerouted";
@@ -54,23 +43,23 @@ export function DagCanvas({ nodeStates, hasReroute, onRetry }: Props) {
 
   const edges: Edge[] = useMemo(() => {
     const mainEdges: Edge[] = [
-      { id: "e-collection-analysis", source: "information_collection", target: "analysis" },
-      { id: "e-analysis-report", source: "analysis", target: "report_writing" },
-      { id: "e-report-review", source: "report_writing", target: "review" },
+      { id: "e-c-a", source: "information_collection", target: "analysis" },
+      { id: "e-a-r", source: "analysis", target: "report_writing" },
+      { id: "e-r-rv", source: "report_writing", target: "review" },
     ].map((e) => ({
       ...e,
       animated: nodeStates[e.source as AgentNodeName]?.status === "completed",
-      style: { stroke: "#52525b", strokeWidth: 2 },
-      markerEnd: { type: MarkerType.ArrowClosed, color: "#52525b" },
+      style: { stroke: "var(--border)", strokeWidth: 2, strokeDasharray: "6 4" },
+      markerEnd: { type: MarkerType.ArrowClosed, color: "var(--text-muted)" },
     }));
 
     if (hasReroute) {
       mainEdges.push({
-        id: "e-review-reroute",
+        id: "e-reroute",
         source: "review",
         target: "analysis",
         animated: true,
-        style: { stroke: "#f59e0b", strokeWidth: 2, strokeDasharray: "5 5" },
+        style: { stroke: "#f59e0b", strokeWidth: 2.5, strokeDasharray: "8 4" },
         markerEnd: { type: MarkerType.ArrowClosed, color: "#f59e0b" },
         label: "REROUTE",
         labelStyle: { fill: "#f59e0b", fontSize: 10, fontWeight: 700 },
@@ -81,10 +70,10 @@ export function DagCanvas({ nodeStates, hasReroute, onRetry }: Props) {
   }, [nodeStates, hasReroute]);
 
   return (
-    <div className="h-full w-full bg-zinc-950/50 rounded-xl border border-zinc-800">
+    <div className="h-full w-full rounded-2xl border border-[var(--border)] bg-dot-grid overflow-hidden">
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} fitView preventScrolling={false}>
-        <Background color="#27272a" gap={20} />
-        <Controls className="[&>button]:bg-zinc-800 [&>button]:border-zinc-700 [&>button]:text-zinc-300" />
+        <Background color="var(--border)" gap={24} size={1} />
+        <Controls className="[&>button]:!bg-[var(--bg-card)] [&>button]:!border-[var(--border)] [&>button]:!text-[var(--text-secondary)] [&>button]:!rounded-lg" />
       </ReactFlow>
     </div>
   );

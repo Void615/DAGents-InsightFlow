@@ -29,7 +29,7 @@ export function ChatStream({ messages, isStreaming, onQuickReply }: Props) {
             className={`max-w-[70%] rounded-2xl px-5 py-4 text-sm ${
               msg.role === "user"
                 ? "bg-emerald-600 text-white rounded-tr-none shadow-md shadow-emerald-900/20"
-                : "bg-zinc-900 border border-zinc-800 rounded-tl-none text-zinc-200 shadow-sm"
+                : "bg-[var(--bg-card)] border border-[var(--border)] rounded-tl-none text-[var(--text-primary)] shadow-sm"
             }`}
           >
             {msg.content ? (
@@ -37,19 +37,17 @@ export function ChatStream({ messages, isStreaming, onQuickReply }: Props) {
                 <p className="leading-relaxed">{msg.content}</p>
               ) : (
                 <div className="
-                  prose prose-sm prose-invert max-w-none
-                  prose-p:leading-[1.85] prose-p:my-3 prose-p:text-zinc-300
-                  prose-headings:text-zinc-100 prose-headings:font-semibold prose-headings:tracking-tight
+                  prose prose-sm max-w-none dark:prose-invert
+                  prose-p:leading-[1.85] prose-p:my-3
+                  prose-headings:font-semibold prose-headings:tracking-tight
                   prose-h2:text-base prose-h2:mt-6 prose-h2:mb-4
                   prose-h3:text-sm prose-h3:mt-5 prose-h3:mb-3
-                  prose-strong:font-medium prose-strong:text-zinc-100
-                  prose-em:text-zinc-400
-                  prose-li:my-2 prose-li:leading-[1.85] prose-li:text-zinc-300
+                  prose-strong:font-medium
+                  prose-li:my-2 prose-li:leading-[1.85]
                   prose-ul:my-4 prose-ol:my-4
                   prose-ul:list-none prose-ul:pl-0
                   prose-ol:list-none prose-ol:pl-0
-                  prose-code:text-emerald-300 prose-code:bg-zinc-800 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:font-normal prose-code:text-xs
-                  prose-hr:border-zinc-700
+                  prose-code:text-emerald-300 dark:prose-code:bg-zinc-800 prose-code:bg-zinc-100 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:font-normal prose-code:text-xs
                   space-y-3
                 ">
                   <ReactMarkdown
@@ -62,7 +60,7 @@ export function ChatStream({ messages, isStreaming, onQuickReply }: Props) {
                             text={text}
                             onClick={() => onQuickReply?.(text)}
                           >
-                            <div className="text-sm text-zinc-300 leading-[1.85]">{children}</div>
+                            <div className="text-sm text-[var(--text-secondary)] leading-[1.85]">{children}</div>
                           </OptionCard>
                         );
                       },
@@ -85,13 +83,13 @@ export function ChatStream({ messages, isStreaming, onQuickReply }: Props) {
       ))}
       {messages.length === 0 && (
         <div className="flex flex-col items-center justify-center h-full text-center gap-3">
-          <div className="w-12 h-12 rounded-full bg-zinc-800 flex items-center justify-center">
-            <svg className="w-6 h-6 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <div className="w-12 h-12 rounded-full bg-[var(--bg-elevated)] flex items-center justify-center">
+            <svg className="w-6 h-6 text-[var(--text-muted)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
             </svg>
           </div>
-          <p className="text-sm text-zinc-400 font-medium">开始对话</p>
-          <p className="text-xs text-zinc-500">AI 将通过对话引导你完成竞品分析配置</p>
+          <p className="text-sm text-[var(--text-secondary)] font-medium">开始对话</p>
+          <p className="text-xs text-[var(--text-muted)]">AI 将通过对话引导你完成竞品分析配置</p>
         </div>
       )}
     </div>
@@ -124,7 +122,7 @@ function OptionCard({
       className={`group w-full text-left p-4 rounded-xl border transition-all duration-200 mb-2 cursor-pointer
         ${selected
           ? "border-emerald-500/50 bg-emerald-500/10 ring-1 ring-emerald-500/20"
-          : "border-zinc-700/50 bg-zinc-800/40 hover:border-emerald-500/30 hover:bg-zinc-800 hover:-translate-y-0.5 active:scale-[0.99]"
+          : "border-[var(--border)] bg-[var(--bg-elevated)] hover:border-emerald-500/30 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 active:scale-[0.99]"
         }`}
     >
       <div className="flex items-start gap-3">

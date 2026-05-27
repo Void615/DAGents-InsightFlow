@@ -5,8 +5,8 @@ const variants = {
   default: "bg-zinc-100 text-zinc-900 hover:bg-zinc-200",
   primary: "bg-emerald-600 text-white hover:bg-emerald-500",
   destructive: "bg-rose-600 text-white hover:bg-rose-500",
-  ghost: "bg-transparent hover:bg-zinc-800 text-zinc-300",
-  outline: "border border-zinc-700 bg-transparent hover:bg-zinc-800 text-zinc-300",
+  ghost: "bg-transparent hover:bg-[var(--bg-elevated)] text-[var(--text-secondary)]",
+  outline: "border border-[var(--border)] bg-transparent hover:bg-[var(--bg-elevated)] text-[var(--text-primary)]",
 } as const;
 
 const sizes = {

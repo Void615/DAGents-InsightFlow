@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/modal";
 import { Spinner } from "@/components/ui/spinner";
-import { formatTime, statusLabel, statusColor } from "@/lib/utils";
+import { formatTime, statusLabel } from "@/lib/utils";
 import { useDeleteWorkflow } from "@/lib/use-workflow";
 import { XCircle } from "lucide-react";
 import type { WorkflowListItem } from "@/types/api";
@@ -26,52 +26,71 @@ export function WorkflowCard({ workflow }: Props) {
     setShowConfirm(false);
   };
 
+  const isRunning = workflow.status === "running";
+
   return (
     <>
-      <Card
-        className="cursor-pointer transition-all hover:border-zinc-600 hover:bg-zinc-900/80 relative group"
+      <div
         onClick={() => router.push(`/workflows/${workflow.id}`)}
+        className="group cursor-pointer rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5 transition-all duration-300 hover:-translate-y-1 hover:border-emerald-500/30"
+        style={{ boxShadow: "var(--card-shadow)" }}
+        onMouseEnter={(e) => { e.currentTarget.style.boxShadow = "var(--card-shadow-hover)"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.boxShadow = "var(--card-shadow)"; }}
       >
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowConfirm(true);
-          }}
-          className="absolute top-1.5 right-1.5 p-1 rounded-md text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700/50 opacity-0 group-hover:opacity-100 transition-all"
-          title="删除"
-        >
-          <XCircle size={13} />
-        </button>
-        <CardHeader>
-          <div className="flex items-center justify-between pr-6">
-            <CardTitle className="truncate">{workflow.title}</CardTitle>
-            <Badge className={statusColor(workflow.status)}>{statusLabel(workflow.status)}</Badge>
+        <div className="flex items-start justify-between mb-3">
+          <div className="flex-1 min-w-0">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)] truncate">
+              {workflow.title}
+            </h3>
+            <p className="text-xs text-[var(--text-muted)] mt-1">
+              {formatTime(workflow.created_at)}
+            </p>
           </div>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center justify-between text-xs text-zinc-500">
-            <span>
-              {workflow.status === "running"
-                ? `Phase: ${workflow.current_phase}`
-                : `Revision ${workflow.revision_count}`}
+          <button
+            onClick={(e) => { e.stopPropagation(); setShowConfirm(true); }}
+            className="shrink-0 ml-2 p-1 rounded-md text-[var(--text-muted)] hover:text-rose-400 hover:bg-rose-500/10 opacity-0 group-hover:opacity-100 transition-all"
+          >
+            <XCircle size={13} />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="relative flex h-2 w-2">
+            {isRunning && (
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+            )}
+            <span
+              className={`relative inline-flex rounded-full h-2 w-2 ${
+                isRunning ? "bg-emerald-400" :
+                workflow.status === "completed" ? "bg-emerald-500" :
+                workflow.status === "failed" ? "bg-rose-500" :
+                "bg-zinc-500"
+              }`}
+            />
+          </span>
+          <span className={`text-xs font-medium ${
+            isRunning ? "text-emerald-400" :
+            workflow.status === "completed" ? "text-emerald-500" :
+            "text-[var(--text-secondary)]"
+          }`}>
+            {statusLabel(workflow.status)}
+          </span>
+          {workflow.status === "running" && (
+            <span className="text-xs text-[var(--text-muted)] ml-auto">
+              {workflow.current_phase}
             </span>
-            <span>{formatTime(workflow.created_at)}</span>
-          </div>
-        </CardContent>
-      </Card>
+          )}
+        </div>
+      </div>
 
       <Modal open={showConfirm} onClose={() => setShowConfirm(false)} title="确认删除">
         <div className="space-y-4">
-          <p className="text-sm text-zinc-400">
-            确定要删除 <span className="text-zinc-200 font-medium">「{workflow.title}」</span> 吗？此操作不可撤销。
+          <p className="text-sm text-[var(--text-secondary)]">
+            确定要删除 <span className="text-[var(--text-primary)] font-medium">「{workflow.title}」</span>？
           </p>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" onClick={() => setShowConfirm(false)}>取消</Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleteMutation.isPending}
-            >
+            <Button variant="destructive" onClick={handleDelete} disabled={deleteMutation.isPending}>
               {deleteMutation.isPending ? <Spinner size={14} /> : <XCircle size={14} />}
               删除
             </Button>

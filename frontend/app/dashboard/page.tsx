@@ -6,11 +6,11 @@ import { useWorkflows } from "@/lib/use-workflow";
 import { AuthGuard } from "@/components/auth/auth-guard";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { Badge } from "@/components/ui/badge";
 import { WorkflowCard } from "@/components/dashboard/workflow-card";
+import { BentoGrid } from "@/components/dashboard/bento-grid";
 import { CreateWorkflowDialog } from "@/components/dashboard/create-workflow-dialog";
 import { EmptyState } from "@/components/shared/empty-state";
-import { Plus, LogOut } from "lucide-react";
+import { Plus, LogOut, Sparkles } from "lucide-react";
 import type { WorkflowStatus } from "@/types/workflow";
 
 const STATUS_FILTERS: Array<{ label: string; value: WorkflowStatus | "all" }> = [
@@ -33,35 +33,43 @@ export default function DashboardPage() {
 
   return (
     <AuthGuard>
-      <div className="min-h-screen bg-zinc-950">
-        <header className="border-b border-zinc-800/80 bg-zinc-950/50 backdrop-blur-md sticky top-0 z-10">
+      <div className="min-h-screen" style={{ backgroundColor: "var(--bg-primary)" }}>
+        <header className="sticky top-0 z-10 border-b border-[var(--border)] bg-[var(--bg-primary)]/80 backdrop-blur-xl">
           <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3">
-            <div>
-              <h1 className="text-lg font-bold text-zinc-100">DAGents InsightFlow</h1>
-              {user && <p className="text-xs text-zinc-500">{user.username}</p>}
-            </div>
             <div className="flex items-center gap-3">
-              <Button variant="primary" size="sm" onClick={() => setShowCreate(true)}>
-                <Plus size={14} />
-                新建分析
+              <div className="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
+                <Sparkles size={16} className="text-emerald-400" />
+              </div>
+              <div>
+                <h1 className="text-sm font-bold text-[var(--text-primary)]">DAGents InsightFlow</h1>
+                {user && <p className="text-xs text-[var(--text-muted)]">{user.username}</p>}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                onClick={() => setShowCreate(true)}
+                className="bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl text-xs gap-1.5 shadow-[0_0_16px_var(--accent-glow)]"
+                size="sm"
+              >
+                <Plus size={14} /> 新建分析
               </Button>
-              <Button variant="ghost" size="sm" onClick={logout}>
+              <button onClick={logout} className="p-2 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-elevated)] transition-colors">
                 <LogOut size={14} />
-              </Button>
+              </button>
             </div>
           </div>
         </header>
 
         <main className="mx-auto max-w-6xl px-6 py-8">
-          <div className="mb-6 flex items-center gap-2 flex-wrap">
+          <div className="mb-6 flex items-center gap-1">
             {STATUS_FILTERS.map((f) => (
               <button
                 key={f.value}
                 onClick={() => setStatusFilter(f.value)}
-                className={`px-3 py-1.5 text-xs rounded-lg transition-colors ${
+                className={`px-3 py-1.5 text-xs rounded-lg transition-all ${
                   statusFilter === f.value
-                    ? "bg-zinc-800 text-zinc-100"
-                    : "text-zinc-500 hover:text-zinc-300"
+                    ? "bg-[var(--bg-elevated)] text-[var(--text-primary)] font-medium"
+                    : "text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
                 }`}
               >
                 {f.label}
@@ -76,19 +84,19 @@ export default function DashboardPage() {
           ) : filtered.length === 0 ? (
             <EmptyState
               title={statusFilter === "all" ? "还没有分析项目" : "没有匹配的工作流"}
-              description="点击「新建分析」创建第一个竞品分析任务"
+              description="创建第一个竞品分析任务，启动 AI Agent 协作流程"
               action={
-                <Button variant="primary" onClick={() => setShowCreate(true)}>
+                <Button onClick={() => setShowCreate(true)} className="bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl shadow-[0_0_16px_var(--accent-glow)]">
                   <Plus size={14} /> 新建分析
                 </Button>
               }
             />
           ) : (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <BentoGrid>
               {filtered.map((w) => (
                 <WorkflowCard key={w.id} workflow={w} />
               ))}
-            </div>
+            </BentoGrid>
           )}
         </main>
 

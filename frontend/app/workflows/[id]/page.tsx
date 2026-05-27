@@ -44,7 +44,7 @@ export default function WorkflowStudioPage() {
   if (isLoading) {
     return (
       <AuthGuard>
-        <div className="flex h-screen items-center justify-center bg-zinc-950">
+        <div className="flex h-screen items-center justify-center" style={{ backgroundColor: "var(--bg-primary)" }}>
           <Spinner size={24} />
         </div>
       </AuthGuard>
@@ -53,7 +53,7 @@ export default function WorkflowStudioPage() {
 
   return (
     <AuthGuard>
-      <div className="min-h-screen bg-zinc-950">
+      <div className="min-h-screen" style={{ backgroundColor: "var(--bg-primary)" }}>
         <Header workflow={workflow} />
         {status === "configuring" && <InterviewView workflowId={id} token={token!} />}
         {status === "running" && <DagRuntimeView workflowId={id} token={token!} />}
@@ -67,20 +67,20 @@ export default function WorkflowStudioPage() {
 
 function Header({ workflow }: { workflow: { title?: string; status?: string; current_phase?: string; revision_count?: number } | undefined }) {
   return (
-    <header className="border-b border-zinc-800/80 bg-zinc-950/50 backdrop-blur-md sticky top-0 z-10">
+    <header className="border-b border-[var(--border)] bg-[var(--bg-primary)]/80 backdrop-blur-xl sticky top-0 z-10">
       <div className="flex items-center justify-between px-6 py-3">
         <div className="flex items-center gap-3">
-          <Link href="/dashboard" className="text-zinc-500 hover:text-zinc-300">
+          <Link href="/dashboard" className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors">
             <ArrowLeft size={18} />
           </Link>
-          <h1 className="text-lg font-bold text-zinc-100">{workflow?.title || "Workflow"}</h1>
+          <h1 className="text-lg font-bold text-[var(--text-primary)]">{workflow?.title || "Workflow"}</h1>
           {workflow?.status && (
             <Badge className={statusColor(workflow.status as Parameters<typeof statusColor>[0]) || ""}>
               {statusLabel(workflow.status as Parameters<typeof statusLabel>[0]) || workflow.status}
             </Badge>
           )}
         </div>
-        <div className="text-xs text-zinc-500">
+        <div className="text-xs text-[var(--text-muted)]">
           {workflow?.revision_count != null && `Revision ${workflow.revision_count}`}
         </div>
       </div>
@@ -150,14 +150,14 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
   };
 
   return (
-    <div className="flex h-[calc(100vh-57px)] bg-zinc-950">
-      <div className="flex flex-col w-[65%] border-r border-zinc-800/80 bg-zinc-950">
-        <div className="px-5 py-3 border-b border-zinc-800/80">
-          <h2 className="text-sm font-semibold text-zinc-200">竞品分析需求访谈</h2>
-          <p className="text-xs text-zinc-500 mt-0.5">AI 将通过对话引导你完成分析配置</p>
+    <div className="flex h-[calc(100vh-57px)]" style={{ backgroundColor: "var(--bg-primary)" }}>
+      <div className="flex flex-col w-[65%] border-r border-[var(--border)]" style={{ backgroundColor: "var(--bg-primary)" }}>
+        <div className="px-5 py-3 border-b border-[var(--border)]">
+          <h2 className="text-sm font-semibold text-[var(--text-primary)]">竞品分析需求访谈</h2>
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">AI 将通过对话引导你完成分析配置</p>
         </div>
         <ChatStream messages={messages} isStreaming={isStreaming} onQuickReply={handleQuickReply} />
-        <div className="p-4 border-t border-zinc-800/80">
+        <div className="p-4 border-t border-[var(--border)]">
           <div className="flex gap-2 max-w-4xl mx-auto">
             <textarea
               value={inputValue}
@@ -175,7 +175,7 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
               placeholder={isComplete ? "配置已锁定，请在右侧确认启动..." : "输入回复，或点击上方的选项卡片快速选择... (Enter 发送，Shift+Enter 换行)"}
               disabled={isComplete || isStreaming}
               rows={1}
-              className="flex-1 resize-none rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 focus-visible:border-emerald-500/50 disabled:opacity-50 transition-colors"
+              className="flex-1 resize-none rounded-2xl border border-[var(--border)] bg-[var(--bg-elevated)] px-4 py-2.5 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 focus-visible:border-emerald-500/50 disabled:opacity-50 transition-all"
             />
             <Button onClick={handleSend} disabled={isComplete || isStreaming} variant="primary" size="icon" className="rounded-xl">
               <Send size={16} />
@@ -183,7 +183,7 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
           </div>
         </div>
       </div>
-      <div className="w-[35%] p-5 bg-zinc-900/30">
+      <div className="w-[35%] p-5 backdrop-blur-xl bg-[var(--bg-primary)]/60 border-l border-[var(--border)]">
         <ConfigPanel
           config={config}
           isComplete={isComplete}
@@ -270,14 +270,20 @@ function DagRuntimeView({ workflowId, token }: { workflowId: string; token: stri
   });
 
   return (
-    <div className="flex h-[calc(100vh-57px)]">
-      <div className="flex-1 flex flex-col p-4 gap-4">
-        <div className="text-sm text-zinc-400 font-medium">DAG Runtime Canvas</div>
+    <div className="flex h-[calc(100vh-57px)]" style={{ backgroundColor: "var(--bg-primary)" }}>
+      <div className="flex-1 flex flex-col p-4 gap-3">
+        <div className="flex items-center gap-2">
+          <span className="relative flex h-2 w-2">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
+          </span>
+          <span className="text-sm font-medium text-[var(--text-primary)]">DAG Runtime Canvas</span>
+        </div>
         <div className="flex-1">
           <DagCanvas nodeStates={nodeStates} hasReroute={hasReroute} />
         </div>
       </div>
-      <div className="w-[420px] p-4 flex flex-col gap-4">
+      <div className="w-[400px] border-l border-[var(--border)] p-4 flex flex-col gap-3" style={{ backgroundColor: "var(--bg-primary)" }}>
         <EventConsole events={events} />
       </div>
     </div>
@@ -388,7 +394,7 @@ function ReportView({ workflowId, workflowStatus }: { workflowId: string; workfl
           {swot && <SwotGrid swot={swot} />}
           {featureMatrix && <FeatureMatrixTable data={featureMatrix} />}
           {!swot && !featureMatrix && (
-            <div className="text-center text-zinc-500 py-12">加载分析数据中...</div>
+            <div className="text-center text-[var(--text-muted)] py-12">加载分析数据中...</div>
           )}
         </TabsContent>
 
@@ -411,19 +417,18 @@ function ReportView({ workflowId, workflowStatus }: { workflowId: string; workfl
                   onCitationClick={setActiveCitation}
                 />
               ) : (
-                <div className="text-center text-zinc-500 py-12">加载报告中...</div>
+                <div className="text-center text-[var(--text-muted)] py-12">加载报告中...</div>
               )}
             </main>
-            <aside className="w-60 shrink-0 border-l border-zinc-800 pl-4">
-              <EvidencePanel
-                citations={report?.citations ?? []}
-                traceLinks={traceLinks ?? []}
-                activeCitationIndex={activeCitation}
-              />
-            </aside>
           </div>
         </TabsContent>
       </Tabs>
+      <EvidencePanel
+        citations={report?.citations ?? []}
+        traceLinks={traceLinks ?? []}
+        activeCitationIndex={activeCitation}
+        onClose={() => setActiveCitation(null)}
+      />
     </div>
   );
 }
