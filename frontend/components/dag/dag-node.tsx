@@ -8,7 +8,7 @@ import { cn } from "@/lib/cn";
 import { formatDuration } from "@/lib/utils";
 import type { NodeStatus } from "./dag-canvas";
 
-interface DagNodeData {
+export interface DagNodeData {
   label: string;
   status: NodeStatus;
   message?: string;

@@ -187,3 +187,204 @@
 - **interrupt() 后节点重新执行**：LangGraph 从 checkpoint 恢复时会重新执行整个节点函数。通过 `human_decision` 注入 state 并检查 `state.get("human_decision")` 来跳过二次暂停，但 agent 的 LLM 调用也会重新执行，带来额外的 token 开销。后续可考虑通过 `_execute_node` 的快速路径优化，在有 `human_decision` 时跳过 agent 调用直接返回缓存结果。
 - **checkpointer 表与业务表不在同一事务**：`checkpoints`/`checkpoint_blobs`/`checkpoint_writes` 三张表由 LangGraph checkpointer 独立管理（通过 psycopg 连接池），与 SQLAlchemy 管理的业务表不在同一事务边界。极端情况下可能出现业务表标记为 paused 但 checkpoint 未保存（或反之），导致 resume 时状态不一致。当前通过先保存 checkpoint（interrupt 内部），再提交业务事务来降低风险，但无法完全消除。
 - **并发恢复风险**：当前未对 `workflow.status` 加乐观锁或分布式锁，理论上可能有两个并发 `POST /decide` 同时触发 resume。后续可增加 `status` 字段的 CAS 检查或引入 Redis 分布式锁。
+
+---
+
+## 2026-05-27
+
+### 8. 通用化人在回路 Jump 机制与 Resume 优化
+
+原有 pause→resume 机制存在三个问题：(1) `resume` 和 `jump` 语义完全重叠，`resume` 没有独立价值；(2) `_review_router` 混杂了 review 特有判断（passed、max_revisions），无法用于其他节点的暂停后跳转；(3) resume 时 ReviewAgent 用相同 state 重新跑一遍 LLM，浪费 token 调用。
+
+#### 修复方案
+
+- **删除 `resume`，统一为 `jump`**：`DecisionAction` 枚举移除 `RESUME`，只保留 `JUMP`/`APPROVE`/`ABORT`。人工 `target_node` 始终优先于 agent 建议
+- **Router 通用化**：`_review_router` → 工厂函数 `make_pause_router(default_next)`，不再检查 `passed` 或 `revision_count >= max_revisions`。这些控制权归还给 agent 自身——通过是否设置 `target_node` 来决定是否触发 reroute。新路由逻辑：人工 jump + 有效 target_node → agent 建议 target_node → `default_next`（正常流程）。所有四个 DAG 节点均使用条件边（`add_conditional_edges`），任意节点返回 `__pause__` 后均可跳转到 reroute 目标，不再只有 review 节点支持
+- **Resume 跳过重复 LLM 调用**：`resume_workflow` 从 `workflow.pause_state.dag_state` 中提取缓存的 `review_result`，通过 `Command(update={"cached_review_result": ...})` 注入 state。`make_review_node` 检测到 `human_decision` + `cached_review_result` 同时存在时，直接返回缓存结果并递增 `revision_count`，完全跳过 `ReviewAgent.run()` 和 `_execute_node`
+- **事件补全**：`REVIEW_REROUTE` → 通用 `REROUTE`（任何节点暂停后的跳转）；新增 `REVIEW_FAILED_MAX_REVISIONS`（修订次数达上限）；`approve` 路径补发 `WORKFLOW_COMPLETE` + SSE；`abort` 路径补发 `WORKFLOW_FAILED`（error_code=USER_ABORTED）+ SSE
+- **pause_options 更新**：`retry` → `jump`，与 API action 名称一致
+
+#### 修改的文件
+
+- `backend/app/schemas/decision.py` — 删除 `DecisionAction.RESUME`；更新 `target_node` 字段描述
+- `backend/app/schemas/event.py` — `REVIEW_REROUTE` → `REROUTE`；新增 `REVIEW_FAILED_MAX_REVISIONS`
+- `backend/app/schemas/workflow_state.py` — 新增 `cached_review_result: Optional[dict]` 字段
+- `backend/app/core/orchestrator.py` — `_review_router` → `make_pause_router(default_next)` 工厂函数；抽取 `REROUTE_TARGETS` 常量；三处 `add_edge` 硬边替换为 `add_conditional_edges`，所有节点均可暂停后跳转
+- `backend/app/agents/review_agent.py` — max_revisions 时发出 `REVIEW_FAILED_MAX_REVISIONS` 事件；`pause_options` 中 `retry` → `jump`
+- `backend/app/core/graph_nodes.py` — `make_review_node`：检测 `cached_review_result` 时跳过 agent 重跑，直接返回缓存结果
+- `backend/app/core/workflow_executor.py` — `resume_workflow`：提取缓存 `review_result` 注入 `Command.update`；发出通用 `REROUTE` 事件；删除 `resume` 动作判断
+- `backend/app/api/v1/workflow.py` — `approve`/`abort` 补全 `EventLogger` + SSE 广播；删除 `resume` 分支；`jump` 改为唯一的 DAG 恢复动作
+- `backend/tests/test_human_in_the_loop.py` — 类名 `TestReviewRouter` → `TestPauseRouter`；`_pause_router` → `make_pause_router("done")`；新增 5 个测试（cached_review_result 跳过、max_revisions 事件、approve/abort SSE）；delete 基于 `RESUME` 的测试用例
+
+#### 可能的潜在问题
+
+- **缓存仅覆盖 review 节点**：当前 `cached_review_result` 机制专门针对 review 节点的 LLM 跳过。若未来其他节点（如 analysis、report）也加入 `__pause__` 并在 resume 时需要跳过重复 LLM 调用，需要为该节点添加类似的缓存 key 和跳过逻辑
+- **Router 依赖 agent 配合**：`_pause_router` 的 fallback 分支（agent 建议 target_node）当前只检查 `state["review_result"]`。若未来其他 agent 也需要建议 target_node，需在 router 中增加对应的 state key 检查，或建立统一的 state 字段约定
+
+---
+
+## 2026-05-28
+
+### 9. 前端 Markdown 渲染与 DAG 画布稳定性修复
+
+#### 修复方案
+
+- **Markdown 渲染**：安装 `@tailwindcss/typography` 插件并在 `globals.css` 注册 `@plugin` 指令。Tailwind v4 默认不含 typography 插件，导致 chat-stream 和 report-viewer 中所有 `prose-*` 类均为空操作。插件激活后已写的 prose 类自动生效，同时添加防御性回退样式（h1-h4/p/ul/ol/li/blockquote）防止插件加载失败时完全无样式。
+- **DAG 节点消失**：四个改动联合修复 — (1) `handleEvent` 加事件白名单守卫，tool_call/llm_request 等无关 SSE 事件不再触发 `setNodeStates`，减少约 70% 无效 re-render；(2) `dag-canvas.tsx` 使用 `useRef` 缓存每个 node 的 data 对象，仅在 status/message/duration_ms 实际变化时创建新引用，使 `DagNode` 的 `React.memo` 真正跳过未变化节点的渲染；(3) 移除 ReactFlow 的 `fitView` prop，消除流式更新时的视口跳动；改为 `defaultViewport` 静态定位；(4) `setHasReroute` 从 `setNodeStates` updater 内部移到外部，消除 React 反模式。
+- **报告样式**：移除 `report-viewer.tsx` 外层 `text-sm`（不再压制标题字号）；修复 `h2` 自定义组件的 `className` 合并逻辑（原来直接覆盖导致 prose 插件生成的字号/粗细/边距丢失）。
+
+#### 修改的文件
+
+- `frontend/package.json` — 新增 `@tailwindcss/typography` 依赖
+- `frontend/app/globals.css` — 注册 `@plugin "@tailwindcss/typography"`；新增防御性 prose 回退样式
+- `frontend/app/workflows/[id]/page.tsx` — `handleEvent` 加事件白名单、`setHasReroute` 移出 updater
+- `frontend/components/dag/dag-canvas.tsx` — 新增 `useRef` data 缓存、移除 `fitView`、添加 `defaultViewport`
+- `frontend/components/dag/dag-node.tsx` — 导出 `DagNodeData` 接口
+- `frontend/components/report/report-viewer.tsx` — 移除 `text-sm`、修复 `h2` className 合并
+
+#### 可能的潜在问题
+
+- **data 缓存未检查 onRetry**：当前 `DagCanvas` 的父组件未传递 `onRetry` prop，缓存比较仅检查 status/message/duration_ms。若后续接入 onRetry 功能，缓存需增加对 onRetry 引用变化的感知（或改用 `useCallback` 稳定化）
+- **prose 回退样式优先级**：防御性回退样式以 `.prose` 前缀写在全局 CSS 中，优先级低于 typography 插件生成的 utility class。但若插件版本升级导致选择器变化，回退样式可能意外生效并与插件样式叠加，需在升级后验证
+
+---
+
+### 10. DAG 运行时节点流式输出面板
+
+DAG 执行期间，各 agent 通过 `LLM_STREAM` 事件广播逐 token 输出，前端新增独立面板实时显示当前活跃节点的 LLM 生成内容。同时保留用户对话框，支持在执行过程中输入反馈。
+
+#### 修复方案
+
+- **流式 token 累积**：新增 `useNodeStream` hook，内部用 `useRef` 按 `node_name` 缓冲 token，以 `requestAnimationFrame` + 64ms 间隔批量刷新到 state（~15fps），避免 per-token 渲染导致 ReactFlow 画布抖动。
+- **LLM_STREAM 事件与 DAG 状态隔离**：`handleEvent` 中 `llm_stream` 事件在生命周期守卫之前处理，直接写入 token buffer 而不触发 `setNodeStates`，确保流式输出不会重新渲染 ReactFlow 节点。
+- **右侧面板改为 Tab 切换**：原 EventConsole 独占的 400px 右侧面板拆分为 "Live Stream"（实时显示当前节点 LLM 输出 + 闪烁光标）和 "Events"（结构化事件日志）两个 tab。
+- **用户对话框**：DAG 画布底部新增输入栏，支持 Enter 发送 / Shift+Enter 换行，消息显示在历史区。为后续人在回路实时打断功能预留交互基础。
+- **`node_start` 切换时自动清空上一节点的流式文本**，`StreamPanel` 显示当前活跃节点名称和实时脉冲指示器。
+
+#### 新增文件
+
+- `frontend/lib/use-node-stream.ts` — token 缓冲 + rAF 批量渲染 hook
+- `frontend/components/events/stream-panel.tsx` — 节点流式输出展示面板
+
+#### 修改的文件
+
+- `frontend/types/event.ts` — `EventType` 新增 `"llm_stream"`
+- `frontend/app/workflows/[id]/page.tsx` — `DagRuntimeView` 集成 `useNodeStream` + `StreamPanel` + 对话框；`handleEvent` 增加 `llm_stream` 和 `node_start` 流式处理分支
+
+#### 可能的潜在问题
+
+- **历史回放无流式内容**：`LLM_STREAM` 事件不写数据库（避免 token 粒度 IO），因此页面刷新后通过 `/events` 回放历史时没有流式文本，Stream 面板为空。后续可在 `node_complete` 事件的 payload 中附带完整输出文本作为回放数据源
+- **rAF 在后台 tab 暂停**：浏览器在非活跃 tab 中会暂停 `requestAnimationFrame`，导致 token 积累在 buffer 中不刷新。切回 tab 时一次性吐出大量文本。当前 `scheduleFlush` 的 fallback 路径在 rAF 未触发时通过 `elapsed >= 64ms` 判断直接 flush，但若 rAF 长时间不触发则无此路径。实际影响较小——用户看不到页面时本就不需要流畅渲染
+
+---
+
+### 11. 修复 DAG 人工跳转死循环 + 移除前端 Events 面板
+
+#### 修复方案
+
+- **collection 死循环**：`human_decision` 通过 `Command(update=...)` 注入 state 后在 resume 路径中从未被清除。Review 节点的 router 正确消费 `human_decision` 跳转到目标节点（如 collection），但目标节点执行完毕后其 router 再次看到同一 `human_decision`，又跳回同一目标节点，形成无限循环。修复方式：`make_pause_router` 中人工 jump 分支从 `return target`（纯字符串）改为 `return Command(goto=target, update={"human_decision": None})`，在消费决策的同时清除之，后续节点的 router 不再看到已消费的决策。
+- **Events 面板移除**：`DagRuntimeView` 将全部 17 种 SSE 事件无上限累积在 `events: WorkflowEvent[]` 中，每个事件到达触触发 `EventConsole` 全量 `.filter().map()` 重渲染，`llm_stream` 等高频事件加剧性能问题。修复：移除 `events` state、`rightTab` 切换逻辑、`EventConsole` 组件及其文件，右侧面板固定显示 `StreamPanel`（LLM 流式输出）。历史事件回放 `useEffect` 仅重建 `nodeStates` 不再存储事件数组。node 状态更新和流式 token 处理不受影响。
+
+#### 修改的文件
+
+- `backend/app/core/orchestrator.py` — 新增 `from langgraph.types import Command`；`make_pause_router` 人工 jump 分支返回 `Command(goto=target, update={"human_decision": None})`
+- `frontend/app/workflows/[id]/page.tsx` — 移除 `events`/`rightTab` state 及 `setEvents` 调用；右侧面板从 tab 切换改为固定 `StreamPanel`；历史回放仅重建 `nodeStates`；移除 `EventConsole` 导入
+- `frontend/components/events/event-console.tsx` — 删除
+
+#### 删除的文件
+
+- `frontend/components/events/event-console.tsx` — Events 面板组件（功能已被 StreamPanel 替代，不再需要）
+
+---
+
+### 12. 修复 Interview 配置完成检测不可靠
+
+Interview 阶段 LLM 输出 `---CONFIG_COMPLETE---` 后，前端有时无法跳转到 ready 状态，Start 按钮始终不出现。
+
+#### 修复方案
+
+- **后端 JSON 提取增强**：`try_extract_config` 先剥离 markdown 代码围栏（`` ```json ... ``` `` 或 ` ``` ... ``` `）再尝试 `find/rfind` 花括号匹配。LLM 经常用围栏包裹 JSON，原逻辑直接 `find("{")` 会在围栏内部的 JSON 前后留下 ` ``` ` 残片导致 `json.loads` 失败。
+- **前端解耦 is_complete 与 extracted_config**：`onConfig` 仅处理配置数据更新，不再兼管完成信号；`onComplete` 从空函数改为直接设置 `isComplete(true)`。原逻辑要求 `is_complete && extracted_config` 同时为真才锁定配置，当后端提取失败发送 `extracted_config: null` 时永远无法完成。
+- **安全网回拉**：`isComplete` 变为 true 时自动 fetch workflow API 拉取后端已持久化的 config，兜底覆盖极端情况。
+- **空数组守卫**：`suggested_competitors` 检查加 `.length > 0`，空数组不再触发无意义的 setConfig。
+
+#### 修改的文件
+
+- `backend/app/agents/interview_agent.py` — `try_extract_config` 增加 markdown 围栏剥离策略；抽取 `_parse_json_block` helper
+- `frontend/app/workflows/[id]/page.tsx` — `onConfig` 移除 `is_complete` 检查；`onComplete` 设置 `isComplete`；`suggested_competitors` 空数组守卫；新增安全网 `useEffect`
+
+---
+
+### 13. 工作流重进入健壮性 — 状态检测与恢复
+
+用户重新打开工作流时，前端应根据当前状态主动跳转到正确界面。修复了 4 个阻碍重进入的关键问题。
+
+#### 修复方案
+
+- **"paused" 状态前端支持**：`WorkflowStatus` 类型、`statusLabel`/`statusColor` 新增 `"paused"` 条目；路由分支 `(status === "running" || status === "paused")` → `DagRuntimeView`；暂停时显示暂停卡片（暂停原因 + 操作按钮）。
+- **对话框接线 /decide 端点**：暂停卡片中的按钮调用 `POST /{id}/decide`，传递 `action`/`target_node`/`feedback`。支持 `jump`（重试指定节点）、`approve`（强制通过）、`abort`（放弃）三种决策。决策提交后显示系统消息确认。
+- **事件类型统一**：`EventType` 新增 `"reroute"` 和 `"workflow_resumed"`；`handleEvent` 和 historical replay 同时处理 `"reroute"` 和 `"review_reroute"` 两种事件名，解决后端 resume 路径发送 `EventType.REROUTE` 而前端只识别 `"review_reroute"` 的 mismtach。
+- **事件回放增强**：历史事件请求升级为 `?limit=200`（此前依赖后端默认 50 条），避免长工作流事件被截断。
+- **僵死工作流检测**：进入 RUNNING 工作流且历史事件重放后，若所有节点状态均为 idle 且最新事件超过 60 秒，判定为僵死工作流（服务重启导致进程丢失），展示警告提示用户返回仪表板重新启动。
+
+#### 修改的文件
+
+- `frontend/types/workflow.ts` — `WorkflowStatus` 新增 `"paused"`；`WorkflowDetail` 新增 `pause_state` 字段类型
+- `frontend/types/event.ts` — `EventType` 新增 `"reroute"` 和 `"workflow_resumed"`
+- `frontend/lib/utils.ts` — `statusLabel` 新增 `paused: "已暂停"`；`statusColor` 新增 amber 主题暂停色
+- `frontend/app/workflows/[id]/page.tsx` — 路由支持 `paused`/`cancelled`；`DagRuntimeView` 接收 `workflow` prop；暂停卡片 UI + `/decide` 接线；事件类型 `reroute` 处理；事件回放 `limit=200`；僵死检测 + 警告提示
+
+#### 可能的潜在问题
+
+- **僵死检测仅前端**：服务重启后僵死工作流仅前端展示警告，无后端自动恢复机制。后续可在后端增加启动时扫描 `running` 工作流并按 checkpoint 自动 resume 的逻辑。
+- **/decide 成功后的 UI 刷新**：决策提交后通过 SSE `workflow_resumed` / `node_start` 事件驱动 UI 更新，而非主动刷新 workflow 查询。若 SSE 连接延迟，暂停卡片可能短暂保持显示。后续可加 `router.refresh()` 强制刷新。
+
+---
+
+### 14. 修复 CHANGELOG #13 未生效 + Interview 配置健壮性 + 多项 latent bug
+
+#### 修复方案
+
+第 13 条添加的工作流重进入恢复机制**完全未生效**——根因是前后端契约不一致：后端 `GET /events` 返回 `{items, total, limit, offset}` 分页信封，前端假设是裸数组，`Array.isArray(body) === false` 直接 early-return，整段历史回放代码（包括 nodeStates 重建与僵死检测）都是死代码。本条同时修复了 interview 配置流的多个结构性问题，并清理了 CHANGELOG #8 / #12 留下的 latent bug。
+
+**Section A — 前端恢复机制**
+
+- **`/events` 响应形状兼容**：`DagRuntimeView` 的 replay `useEffect` 接受 `{items}` 信封与裸数组两种形状，兼容现有后端契约并对未来改动免疫。**这是让 #13 真正生效的关键 fix**。
+- **InterviewView 重进入水合**：将 `config` / `isComplete` 从 `useState({})` 改为 `useState(() => fromWorkflow(workflow.config))` 懒初始化，重新打开工作流时右侧面板立即恢复已收集字段；若 `target_product + product_category` 均已存在则视为"可直接启动"，无需用户重新发送一条访谈消息触发 META。
+- **解锁 isComplete 后的输入框**：textarea / send 按钮 disabled 条件从 `isComplete || isStreaming` 改为仅 `isStreaming`；`sendUserMessage` guard 同步去掉 `isComplete` 检查；`ConfigPanel` 新增"继续编辑访谈" ghost 按钮，让用户在配置不满意时仍能继续修订。
+- **路由 switch 补齐 `created` + 未知 status fallback**：`created` 视为 configuring 入口；`workflow == null` 渲染"工作流不存在"卡片；未知 status 渲染调试卡片 + 刷新按钮（避免任何 enum 演进时出现整页空白）。
+- **`handleDecide` 失效 workflow 查询**：成功路径后调用 `qc.invalidateQueries({queryKey: ["workflow", id]})`，approve→ReportView / jump→running view 切换不再依赖 SSE 到达。
+- **ReportView token 一致性**：3 处 `localStorage.getItem("access_token")` 替换为 `useAuth().token`，与 InterviewView / DagRuntimeView 对齐，登出/换 token 时不会读到过期凭证。`ReportView` 内部对 `/events` 端点的另一次调用同步接受 `{items}` 信封。
+
+**Section B — Interview 配置可靠性**
+
+- **`/start` 错误内联回显**：`handleStart` 用 try/catch 捕获，提取 `response.data.detail` 渲染为 rose 色提示（之前完全静默）。配置编辑时自动清空错误。
+- **本地 canStart 校验 gate**：`Boolean(target_product && product_category)` 才允许点击 Start。按钮 disabled 时提示"请先补全产品名称和品类"。
+- **`/start` 接受可选 config body**（前后端）：`useStartWorkflow.mutationFn` 改为 `({id, config})`，POST body 为完整 `WorkflowConfig`；后端 `start_workflow_endpoint` 接受可选 `WorkflowConfig | None = Body(default=None)`，service 层在状态校验前用其覆盖 `workflow.config`（`flag_modified` 标记 JSON 列变更）。**让右侧面板用户编辑成为权威配置**，即使 LLM 完全未提取 JSON 也能启动。`ConfigPanel` Start 渲染条件从 `isComplete` 放宽为 `isComplete || canStart`，允许无 sentinel 也可启动。
+
+**Section C — Latent bug 与其他优化**
+
+- **`pause_state.dag_state` 持久化（修 CHANGELOG #8 的死代码）**：`workflow_executor.py` 两处持久化点（run_workflow + resume_workflow）都加上 `dag_state: pause_data.get("dag_state", {})`。原代码显式丢弃这个字段但 `resume_workflow:205-206` 又试图从中读 `review_result`，使 `cached_review_result` 永远为 None——CHANGELOG #8 的"跳过 review LLM 重跑"优化是死代码。同时修了 `resume_workflow` 在清空 `pause_state` **之前**就读 `dag_state` 的顺序——之前因为 `pause_state = None` 已经先执行，`dag_state` 永远是 `{}`（即使 C1 持久化也读不到）。现在引入 `dag_state_before` / `paused_by_node_before` 快照变量，在 commit 前抓取。
+- **running 状态 polling 兜底**：`useWorkflow` 新增 `refetchInterval: (q) => q.state.data?.status === "running" ? 15_000 : false` + `refetchOnWindowFocus: true`。SSE 丢失 `workflow_complete` 时 15s 内仍能切到 ReportView，终态自动停止轮询。
+- **`WorkflowDetail` 类型对齐后端**：移除从未填充的 `progress`（含 `phases.collecting` 等死字段）和 `PhaseStatus`；新增 `max_revisions`、`total_tokens`、`error_message`、`completed_at`、`pause_state.dag_state`；`config` 类型放宽为 `Partial<WorkflowConfig>` 反映 JSON 列可能为部分配置的现实。
+- **`try_extract_config` 平衡括号扫描**：`_parse_json_block` 的 `find("{")` + `rfind("}")` 在 LLM 回复中含对话性大括号（如 `{user_name}`、模板占位符）时会跨越正确的 JSON 边界，导致 `json.loads` 失败。新增 `_iter_balanced_json_blocks` 工具方法，逐字符维护括号深度计数器（正确处理字符串字面量与转义），yield 所有顶层 `{...}` 子串；`try_extract_config` 优先 markdown fence，否则取**最后一个**通过 Pydantic 校验的 block（LLM 通常先草拟再给最终配置）。
+
+#### 修改的文件
+
+- `frontend/app/workflows/[id]/page.tsx` — A1/A2/A3/A4/A5/A6/B1/B2/B3
+- `frontend/components/interview/config-panel.tsx` — 新增 `canStart` / `startError` / `onResumeEditing` props；Start gating 改为 `(isComplete || canStart)`；新增 caption 与"继续编辑访谈" ghost 按钮；inline 错误回显
+- `frontend/lib/use-workflow.ts` — `useStartWorkflow.mutationFn` 改为 `({id, config})`；`useWorkflow` 新增 `refetchInterval` / `refetchOnWindowFocus`
+- `frontend/types/workflow.ts` — 移除 `PhaseStatus` 与 `WorkflowDetail.progress`，补齐 `max_revisions`/`total_tokens`/`error_message`/`completed_at`/`pause_state.dag_state`
+- `backend/app/api/v1/workflow.py` — `start_workflow_endpoint` 接受可选 `WorkflowConfig | None = Body(default=None)`
+- `backend/app/services/workflow_service.py` — `start_workflow` 增加 `override_config` 形参，使用 `flag_modified` 标记 JSON 列变更
+- `backend/app/core/workflow_executor.py` — 两处 `pause_state` 持久化点新增 `dag_state` 字段；`resume_workflow` 在 commit 前快照 `dag_state_before` / `paused_by_node_before`
+- `backend/app/agents/interview_agent.py` — 新增 `_iter_balanced_json_blocks`；`_parse_json_block` 与 `try_extract_config` 重写采用平衡扫描 + Pydantic 校验
+
+#### 可能的潜在问题
+
+- **InterviewView 懒水合不响应 server.config 更新**：另一个 tab 完成访谈后回到本 tab，新的 `workflow.config` 不会被本 tab 拿来覆盖本地状态。这是有意设计（保护用户编辑），但若两个 tab 同时操作可能出现配置漂移。后续可加版本号 / mtime 检测，或在 useWorkflow 刷新时显式提示用户合并。
+- **handleDecide 后立即 invalidate 可能撞上后端事务延迟**：jump 路径是 BG task，invalidate 触发的 refetch 可能仍读到 `status=paused`，UI 短暂停留在暂停卡片。SSE 到达后自然刷新。可接受。
+- **`pause_state.dag_state` 可能撑大 JSON 列**：当前 `_sanitize_for_json` 已剥离 `messages`，但 `raw_data`（采集到的搜索原文）会一并写入。PostgreSQL JSON 列单行无硬上限但查询会变慢。后续可在 sanitize 中再去掉 `raw_data` 字段，仅保留 review/report 结构化结果。
+- **`try_extract_config` 取最后一个有效 block 的策略可能误判**：若 LLM 在确认配置后又继续输出其他不相关 JSON（罕见），会取后者。`---CONFIG_COMPLETE---` 哨兵 + markdown fence 优先策略仍是首选保护层。
+- **`override_config` 信任前端**：前端可发任意合法 `WorkflowConfig` 覆盖访谈结果。当前权限模型下用户只能操作自己的 workflow，影响可控；后续若引入团队/审批流需要重新评估。
+

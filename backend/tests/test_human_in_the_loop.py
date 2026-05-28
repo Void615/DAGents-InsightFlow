@@ -2,7 +2,7 @@
 Tests for human-in-the-loop (HITL) mechanism and node recovery/resume.
 
 Covers:
-- _review_router conditional routing logic
+- _pause_router conditional routing logic
 - DecisionRequest schema validation
 - execute_with_retry: GraphInterrupt propagation, retry behaviour
 - ReviewAgent rule-based pause signal generation
@@ -18,9 +18,10 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.orchestrator import _review_router
+from app.core.orchestrator import make_pause_router
 from app.core.node_executor import execute_with_retry, NodeFatalError
 from app.schemas.decision import DecisionRequest, DecisionAction
+from app.schemas.event import EventType
 from app.agents.review_agent import ReviewAgent
 from app.schemas.review import ReviewOutput, ReviewCheck
 from app.db.models.workflow import Workflow
@@ -59,95 +60,91 @@ def _make_review_dict(passed: bool, score: float = 75.0, target_node: str = "ana
 # TestReviewRouter — pure function tests for conditional edge routing
 # ---------------------------------------------------------------------------
 
-class TestReviewRouter:
-    """Tests for _review_router(state) → node_name | 'done'."""
+class TestPauseRouter:
+    """Tests for make_pause_router("done")(state) → node_name | 'done'."""
 
     def test_passed_review_routes_to_done(self):
         state = {"review_result": _make_review_dict(passed=True)}
-        assert _review_router(state) == "done"
+        assert make_pause_router("done")(state) == "done"
 
     def test_none_review_routes_to_done(self):
-        assert _review_router({}) == "done"
-        assert _review_router({"review_result": None}) == "done"
+        assert make_pause_router("done")({}) == "done"
+        assert make_pause_router("done")({"review_result": None}) == "done"
 
-    def test_max_revisions_exceeded_routes_to_done(self):
+    def test_passed_review_has_no_target_node_routes_to_done(self):
+        """Passed review sets target_node=None, router sees no valid target → done."""
+        state = {"review_result": _make_review_dict(passed=True, target_node=None)}
+        assert make_pause_router("done")(state) == "done"
+
+    def test_max_revisions_review_may_routes_to_done(self):
+        """When max_revisions reached, agent sets no target_node → router goes done."""
         state = {
-            "review_result": _make_review_dict(passed=False),
+            "review_result": _make_review_dict(passed=False, target_node=None),
             "revision_count": 3,
             "max_revisions": 3,
         }
-        assert _review_router(state) == "done"
+        assert make_pause_router("done")(state) == "done"
 
-    def test_human_decision_resume_routes_to_target_node(self):
+    def test_human_jump_has_priority_over_agent_target(self):
+        """Human jump target takes priority over agent's suggested target_node."""
         state = {
             "review_result": _make_review_dict(passed=False, target_node="analysis"),
-            "revision_count": 0,
-            "max_revisions": 3,
-            "human_decision": {"action": "resume", "target_node": "information_collection"},
+            "human_decision": {"action": "jump", "target_node": "information_collection"},
         }
-        assert _review_router(state) == "information_collection"
+        assert make_pause_router("done")(state) == "information_collection"
 
-    def test_human_decision_jump_routes_to_target_node(self):
+    def test_human_jump_routes_to_target_node(self):
         state = {
             "review_result": _make_review_dict(passed=False, target_node="analysis"),
-            "revision_count": 0,
-            "max_revisions": 3,
             "human_decision": {"action": "jump", "target_node": "report_writing"},
         }
-        assert _review_router(state) == "report_writing"
+        assert make_pause_router("done")(state) == "report_writing"
 
-    def test_human_decision_invalid_action_falls_back_to_review_target(self):
-        state = {
-            "review_result": _make_review_dict(passed=False, target_node="information_collection"),
-            "revision_count": 0,
-            "max_revisions": 3,
-            "human_decision": {"action": "approve"},
-        }
-        assert _review_router(state) == "information_collection"
-
-    def test_human_decision_invalid_target_node_falls_back(self):
+    def test_human_jump_invalid_target_falls_back_to_agent(self):
         state = {
             "review_result": _make_review_dict(passed=False, target_node="analysis"),
-            "revision_count": 0,
-            "max_revisions": 3,
-            "human_decision": {"action": "resume", "target_node": "bogus_node"},
+            "human_decision": {"action": "jump", "target_node": "bogus_node"},
         }
-        assert _review_router(state) == "analysis"
+        assert make_pause_router("done")(state) == "analysis"
 
-    def test_no_human_decision_uses_review_target_node(self):
-        state = {
-            "review_result": _make_review_dict(passed=False, target_node="report_writing"),
-            "revision_count": 0,
-            "max_revisions": 3,
-        }
-        assert _review_router(state) == "report_writing"
-
-    def test_review_target_node_invalid_defaults_to_analysis(self):
-        state = {
-            "review_result": _make_review_dict(passed=False, target_node="bogus"),
-            "revision_count": 0,
-            "max_revisions": 3,
-        }
-        assert _review_router(state) == "analysis"
-
-    def test_missing_target_node_defaults_to_analysis(self):
-        review = _make_review_dict(passed=False)
-        del review["target_node"]
-        state = {
-            "review_result": review,
-            "revision_count": 0,
-            "max_revisions": 3,
-        }
-        assert _review_router(state) == "analysis"
-
-    def test_human_decision_empty_dict_falls_back(self):
+    def test_approve_action_falls_back_to_agent_target(self):
+        """approve is not 'jump', so router ignores human_decision and uses agent target."""
         state = {
             "review_result": _make_review_dict(passed=False, target_node="information_collection"),
-            "revision_count": 0,
-            "max_revisions": 3,
+            "human_decision": {"action": "approve"},
+        }
+        assert make_pause_router("done")(state) == "information_collection"
+
+    def test_no_human_decision_uses_agent_target_node(self):
+        state = {
+            "review_result": _make_review_dict(passed=False, target_node="report_writing"),
+        }
+        assert make_pause_router("done")(state) == "report_writing"
+
+    def test_agent_target_node_invalid_falls_to_done(self):
+        """Invalid agent target_node → done (no reroute)."""
+        state = {
+            "review_result": _make_review_dict(passed=False, target_node="bogus"),
+        }
+        assert make_pause_router("done")(state) == "done"
+
+    def test_missing_target_node_falls_to_done(self):
+        """No target_node anywhere → done (no reroute)."""
+        review = _make_review_dict(passed=False)
+        del review["target_node"]
+        state = {"review_result": review}
+        assert make_pause_router("done")(state) == "done"
+
+    def test_human_decision_empty_dict_falls_back_to_agent(self):
+        state = {
+            "review_result": _make_review_dict(passed=False, target_node="information_collection"),
             "human_decision": {},
         }
-        assert _review_router(state) == "information_collection"
+        assert make_pause_router("done")(state) == "information_collection"
+
+    def test_no_review_no_human_falls_to_done(self):
+        """Neither review_result nor human_decision → done."""
+        assert make_pause_router("done")({}) == "done"
 
 
 # ---------------------------------------------------------------------------
@@ -155,12 +152,6 @@ class TestReviewRouter:
 # ---------------------------------------------------------------------------
 
 class TestDecisionRequest:
-    def test_valid_resume_action(self):
-        d = DecisionRequest(action=DecisionAction.RESUME, target_node="analysis", feedback="ok")
-        assert d.action == DecisionAction.RESUME
-        assert d.target_node == "analysis"
-        assert d.feedback == "ok"
-
     def test_valid_approve_action(self):
         d = DecisionRequest(action=DecisionAction.APPROVE)
         assert d.action == DecisionAction.APPROVE
@@ -175,8 +166,8 @@ class TestDecisionRequest:
         d = DecisionRequest(action=DecisionAction.JUMP, target_node="information_collection")
         assert d.action == DecisionAction.JUMP
 
-    def test_default_values(self):
-        d = DecisionRequest(action=DecisionAction.RESUME)
+    def test_jump_without_target_node(self):
+        d = DecisionRequest(action=DecisionAction.JUMP)
         assert d.target_node is None
         assert d.feedback == ""
 
@@ -413,6 +404,41 @@ class TestReviewAgentRuleBased:
         assert "__pause__" not in result
         assert result["review_result"]["passed"] is True
 
+    @pytest.mark.asyncio
+    async def test_max_revisions_emits_review_failed_event(self):
+        """When max_revisions reached, REVIEW_FAILED_MAX_REVISIONS event is emitted."""
+        agent = ReviewAgent()
+        state = {
+            "config": {"target_product": "test"},
+            "report": {
+                "title": "",
+                "executive_summary": "",
+                "full_markdown": "short",
+                "sections": [{"title": "s1"}],
+                "citations": [],
+            },
+            "raw_data": {},
+            "feature_matrix": {"matrix": [{"feature": "f1"}]},
+            "pricing_comparison": {"plans": [{"name": "basic"}]},
+            "user_sentiment": {"per_product": {"a": "positive"}},
+            "swot": {"strengths": ["strong brand"]},
+            "revision_count": 3,
+            "max_revisions": 3,
+        }
+        event_logger = AsyncMock()
+        with patch("app.agents.review_agent.llm_is_configured", return_value=False):
+            result = await agent.run(state, event_logger, uuid.uuid4())
+
+        assert "__pause__" not in result
+        # log_and_broadcast internally calls event_logger.log(); check for the
+        # REVIEW_FAILED_MAX_REVISIONS event type in those calls
+        event_types_called = []
+        for c in event_logger.log.call_args_list:
+            et = c.kwargs.get("event_type") or (c.args[0] if c.args else None)
+            if et is not None:
+                event_types_called.append(et.value if hasattr(et, 'value') else str(et))
+        assert EventType.REVIEW_FAILED_MAX_REVISIONS.value in event_types_called
+
 
 # ---------------------------------------------------------------------------
 # TestExecuteNodePauseDetection — _execute_node interrupt/resume paths
@@ -454,7 +480,7 @@ class TestExecuteNodePauseDetection:
         event_logger.with_node.return_value = event_logger
         wf_id = uuid.uuid4()
 
-        state = {"human_decision": {"action": "resume", "target_node": "analysis"}, "revision_count": 0}
+        state = {"human_decision": {"action": "jump", "target_node": "analysis"}, "revision_count": 0}
 
         async def agent_run(state, el, wid):
             return {"__pause__": True, "pause_reason": "should not pause", "data": "value"}
@@ -466,7 +492,7 @@ class TestExecuteNodePauseDetection:
         mock_interrupt.assert_not_called()
         # Result should merge business data + human_decision + incremented revision_count
         assert result["data"] == "value"
-        assert result["human_decision"] == {"action": "resume", "target_node": "analysis"}
+        assert result["human_decision"] == {"action": "jump", "target_node": "analysis"}
         assert result["revision_count"] == 1
 
     @pytest.mark.asyncio
@@ -486,6 +512,60 @@ class TestExecuteNodePauseDetection:
 
         mock_interrupt.assert_not_called()
         assert result == {"data": "normal result"}
+
+
+# ---------------------------------------------------------------------------
+# TestCachedReviewResultSkip — make_review_node skips agent on resume
+# ---------------------------------------------------------------------------
+
+class TestCachedReviewResultSkip:
+    """Tests for make_review_node cached_review_result short-circuit."""
+
+    @pytest.mark.asyncio
+    async def test_cached_review_skips_agent_call(self):
+        """When state has human_decision + cached_review_result, ReviewAgent.run is skipped."""
+        from app.core.graph_nodes import make_review_node
+
+        db = AsyncMock(spec=AsyncSession)
+        event_logger = AsyncMock()
+        event_logger.with_node.return_value = event_logger
+        wf_id = uuid.uuid4()
+
+        review_node = make_review_node(db, wf_id, event_logger, 1)
+        cached = _make_review_dict(passed=False, score=45, target_node="analysis")
+        state = {
+            "human_decision": {"action": "jump", "target_node": "analysis"},
+            "cached_review_result": cached,
+            "revision_count": 0,
+        }
+        with patch("app.core.graph_nodes._review_agent.run") as mock_run:
+            result = await review_node(state)
+
+        mock_run.assert_not_called()
+        assert result["revision_count"] == 1
+        assert result["score"] == 45
+        assert result["human_decision"] == {"action": "jump", "target_node": "analysis"}
+
+    @pytest.mark.asyncio
+    async def test_no_cached_result_calls_agent_normally(self):
+        """Without cached_review_result, agent is called normally."""
+        from app.core.graph_nodes import make_review_node
+
+        db = AsyncMock(spec=AsyncSession)
+        event_logger = AsyncMock()
+        event_logger.with_node.return_value = event_logger
+        wf_id = uuid.uuid4()
+
+        review_node = make_review_node(db, wf_id, event_logger, 1)
+        state = {
+            "human_decision": {"action": "jump", "target_node": "analysis"},
+            "revision_count": 0,
+        }
+        with patch("app.core.graph_nodes._review_agent.run") as mock_run:
+            mock_run.return_value = {"review_result": _make_review_dict(passed=False), "current_phase": "reviewing"}
+            await review_node(state)
+
+        mock_run.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -564,12 +644,12 @@ class TestDecideEndpoint:
         assert wf.pause_state is None
 
     @pytest.mark.asyncio
-    async def test_resume_triggers_background_task(self, client: AsyncClient, db_session: AsyncSession):
+    async def test_jump_triggers_background_task(self, client: AsyncClient, db_session: AsyncSession):
         token = await _get_auth_token(client)
 
         resp = await client.post(
             "/api/v1/workflows",
-            json={"title": "decide-resume-test"},
+            json={"title": "decide-jump-bg-test"},
             headers={"Authorization": f"Bearer {token}"},
         )
         wf_id = resp.json()["workflow_id"]
@@ -582,43 +662,15 @@ class TestDecideEndpoint:
         with patch("app.api.v1.workflow.resume_workflow") as mock_resume:
             resp = await client.post(
                 f"/api/v1/workflows/{wf_id}/decide",
-                json={"action": "resume", "target_node": "analysis", "feedback": "try again"},
+                json={"action": "jump", "target_node": "analysis", "feedback": "try again"},
                 headers={"Authorization": f"Bearer {token}"},
             )
 
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "running"
-        assert data["action"] == "resume"
-        # In FastAPI test mode, background tasks run inline; verify resume_workflow was triggered
-        assert mock_resume.call_count >= 1
-
-    @pytest.mark.asyncio
-    async def test_jump_triggers_background_task(self, client: AsyncClient, db_session: AsyncSession):
-        token = await _get_auth_token(client)
-
-        resp = await client.post(
-            "/api/v1/workflows",
-            json={"title": "decide-jump-test"},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        wf_id = resp.json()["workflow_id"]
-
-        wf = await db_session.get(Workflow, uuid.UUID(wf_id))
-        wf.status = "paused"
-        wf.pause_state = {"paused_by_node": "review", "pause_reason": "test"}
-        await db_session.commit()
-
-        resp = await client.post(
-            f"/api/v1/workflows/{wf_id}/decide",
-            json={"action": "jump", "target_node": "information_collection"},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "running"
         assert data["action"] == "jump"
-        assert data["target_node"] == "information_collection"
+        assert mock_resume.call_count >= 1
 
     @pytest.mark.asyncio
     async def test_decide_on_non_paused_workflow_fails(self, client: AsyncClient, db_session: AsyncSession):
@@ -638,6 +690,61 @@ class TestDecideEndpoint:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 400  # InvalidStateTransitionError
+
+    @pytest.mark.asyncio
+    async def test_approve_emits_workflow_complete_sse(self, client: AsyncClient, db_session: AsyncSession):
+        token = await _get_auth_token(client)
+
+        resp = await client.post(
+            "/api/v1/workflows",
+            json={"title": "approve-sse-test"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        wf_id = resp.json()["workflow_id"]
+
+        wf = await db_session.get(Workflow, uuid.UUID(wf_id))
+        wf.status = "paused"
+        wf.pause_state = {"paused_by_node": "review", "pause_reason": "test"}
+        await db_session.commit()
+
+        with patch("app.api.v1.workflow.sse_manager.broadcast") as mock_broadcast:
+            resp = await client.post(
+                f"/api/v1/workflows/{wf_id}/decide",
+                json={"action": "approve"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200
+        broadcast_calls = [c[0][1]["event_type"] for c in mock_broadcast.call_args_list]
+        assert "workflow_complete" in broadcast_calls
+
+    @pytest.mark.asyncio
+    async def test_abort_emits_workflow_failed_sse(self, client: AsyncClient, db_session: AsyncSession):
+        token = await _get_auth_token(client)
+
+        resp = await client.post(
+            "/api/v1/workflows",
+            json={"title": "abort-sse-test"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        wf_id = resp.json()["workflow_id"]
+
+        wf = await db_session.get(Workflow, uuid.UUID(wf_id))
+        wf.status = "paused"
+        wf.pause_state = {"paused_by_node": "review", "pause_reason": "test"}
+        await db_session.commit()
+
+        with patch("app.api.v1.workflow.sse_manager.broadcast") as mock_broadcast:
+            resp = await client.post(
+                f"/api/v1/workflows/{wf_id}/decide",
+                json={"action": "abort"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200
+        broadcast_calls = [c[0][1]["event_type"] for c in mock_broadcast.call_args_list]
+        assert "workflow_failed" in broadcast_calls
+        # Verify error code
+        error_calls = [c[0][1] for c in mock_broadcast.call_args_list if c[0][1].get("error_code") == "USER_ABORTED"]
+        assert len(error_calls) == 1
 
     @pytest.mark.asyncio
     async def test_decide_on_nonexistent_workflow_fails(self, client: AsyncClient):

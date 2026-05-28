@@ -88,6 +88,11 @@ class ReviewAgent(BaseAgent):
             revision_count = state.get("revision_count", 0)
             max_revisions = state.get("max_revisions", 3)
             if revision_count >= max_revisions:
+                await self.log_and_broadcast(event_logger, EventType.REVIEW_FAILED_MAX_REVISIONS, {
+                    "revision_count": revision_count,
+                    "max_revisions": max_revisions,
+                    "score": review.score,
+                }, workflow_id)
                 return {
                     "review_result": review.model_dump(mode="json"),
                     "current_phase": "reviewing",
@@ -96,7 +101,7 @@ class ReviewAgent(BaseAgent):
                 "__pause__": True,
                 "pause_reason": review.feedback or f"报告评分 {review.score}，未通过质检",
                 "pause_options": [
-                    {"value": "retry", "label": "按建议重试", "target_node": review.target_node or "analysis"},
+                    {"value": "jump", "label": "按建议重试", "target_node": review.target_node or "analysis"},
                     {"value": "approve", "label": "强制通过（接受当前报告）"},
                     {"value": "abort", "label": "放弃本次分析"},
                 ],

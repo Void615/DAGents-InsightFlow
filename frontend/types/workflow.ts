@@ -2,6 +2,7 @@ export type WorkflowStatus =
   | "created"
   | "configuring"
   | "running"
+  | "paused"
   | "completed"
   | "failed"
   | "cancelled";
@@ -18,28 +19,26 @@ export interface WorkflowConfig {
   extra_requirements: string;
 }
 
-export interface PhaseStatus {
-  status: "pending" | "running" | "completed" | "failed";
-  started_at?: string;
-  duration_ms?: number;
-}
-
 export interface WorkflowDetail {
   id: string;
   title: string;
   status: WorkflowStatus;
   current_phase: string;
-  config: WorkflowConfig;
+  config: Partial<WorkflowConfig>;
   revision_count: number;
-  progress: {
-    phases: {
-      collecting: PhaseStatus;
-      analyzing: PhaseStatus;
-      writing: PhaseStatus;
-      reviewing: PhaseStatus;
-    };
-    total_tokens: number;
-  };
+  max_revisions?: number;
+  total_tokens?: number;
+  error_message?: string | null;
+  pause_state?: {
+    paused_by_node: string;
+    pause_reason: string;
+    pause_options: Array<{ value: string; label: string; target_node?: string }>;
+    pause_context?: Record<string, unknown>;
+    /** 暂停时 DAG state 快照（供 resume 复用 cached_review_result） */
+    dag_state?: Record<string, unknown>;
+    paused_at: string;
+  } | null;
   created_at: string;
   updated_at: string;
+  completed_at?: string | null;
 }

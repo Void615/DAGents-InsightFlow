@@ -1,4 +1,5 @@
 import json
+import re
 from typing import AsyncGenerator, List
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, BaseMessage
@@ -91,19 +92,71 @@ class InterviewAgent:
     def try_extract_config(self, full_text: str) -> WorkflowConfig | None:
         """从 LLM 累积回复中提取 WorkflowConfig。
 
-        采用宽松匹配（取第一个 { 到最后一个 }），而非要求 JSON 是唯一内容，
-        因为 LLM 可能在对话文本中嵌入 JSON 而非单独输出。
+        策略：(1) 优先剥离 markdown 代码围栏 ```json ... ``` 内的内容；
+        (2) 否则用平衡括号扫描器在全文中找出所有顶层 JSON object，
+            依次尝试解析与 Pydantic 校验，返回**最后一个**通过校验的 object。
+
+        相比旧的 find/rfind 匹配，平衡扫描可避免吞并对话文本中的 `{user_name}` 等
+        碎片大括号；优先取最后一个有效 block 是因为 LLM 通常会先草拟再给出最终配置。
         """
+        fence_matches = re.findall(r'```(?:json)?\s*\n?(.*?)\n?```', full_text, re.DOTALL)
+        for match in fence_matches:
+            config = self._parse_json_block(match)
+            if config:
+                return config
+        last_valid: WorkflowConfig | None = None
+        for block in self._iter_balanced_json_blocks(full_text):
+            parsed = self._parse_json_block(block)
+            if parsed:
+                last_valid = parsed
+        return last_valid
+
+    def _iter_balanced_json_blocks(self, text: str):
+        """从 text 中以平衡括号扫描方式 yield 每个顶层 `{...}` 子串。
+
+        正确处理字符串字面量中的大括号与 `\\"` 转义，避免对话文本里的 `{x}`
+        与真正 JSON 混淆。
+        """
+        depth = 0
+        start = -1
+        in_string = False
+        escape = False
+        for i, ch in enumerate(text):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start != -1:
+                        yield text[start:i + 1]
+                        start = -1
+
+    def _parse_json_block(self, text: str) -> WorkflowConfig | None:
         try:
-            start = full_text.find("{")
-            end = full_text.rfind("}")
-            if start != -1 and end != -1:
-                json_str = full_text[start:end+1]
-                data = json.loads(json_str)
-                return WorkflowConfig(**data)
+            stripped = text.strip()
+            if not stripped.startswith("{"):
+                # 兼容上层传入的完整 markdown 段；fallback 到首尾大括号
+                start = stripped.find("{")
+                end = stripped.rfind("}")
+                if start == -1 or end == -1 or end <= start:
+                    return None
+                stripped = stripped[start:end + 1]
+            data = json.loads(stripped)
+            return WorkflowConfig(**data)
         except Exception:
             return None
-        return None
 
     def is_complete_signal(self, full_text: str) -> bool:
         """检测 LLM 是否输出了配置完成哨兵。

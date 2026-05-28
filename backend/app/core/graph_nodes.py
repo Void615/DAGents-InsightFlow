@@ -205,6 +205,21 @@ def make_report_node(db: AsyncSession, workflow_id: uuid.UUID, event_logger: Eve
 # review node
 def make_review_node(db: AsyncSession, workflow_id: uuid.UUID, event_logger: EventLogger, execution_attempt: int):
     async def review_node(state: dict) -> dict:
+        # 恢复路径：若 state 中已有 human_decision 和缓存的 review_result，
+        # 跳过 ReviewAgent 重跑，直接使用缓存结果（避免浪费 LLM 调用）
+        if state.get("human_decision") and state.get("cached_review_result"):
+            revision_count = state.get("revision_count", 0)
+            result = {
+                **state["cached_review_result"],
+                "human_decision": state["human_decision"],
+                "revision_count": revision_count + 1,
+                "current_phase": "reviewing",
+            }
+            merged = {**state, **result}
+            await _save_node_state(db, workflow_id, execution_attempt, "review",
+                                   revision_count, merged, 0)
+            return result
+
         result = await _execute_node(db, workflow_id, execution_attempt, "review", state, event_logger, _review_agent.run)
         return result
     return review_node

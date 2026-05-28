@@ -417,3 +417,65 @@ python -m pytest -v
 | `templates` | JSON | NOT NULL, DEFAULT '{}' | 搜索模板配置 |
 | `description` | VARCHAR(255) | NULL | 模板描述 |
 | `created_at` | TIMESTAMPTZ | NOT NULL | 创建时间 |
+
+## 一个跑通的工作流示例
+
+### 用户访谈 Interview Agent
+
+1. 登录后取得token
+
+POST api/v1/auth/login
+
+2. 创建工作流
+
+POST api/v1/workflows
+
+传入title: "分析英雄牌钢笔的竞品"
+
+3. 进行访谈（多轮对话）
+
+POST api/v1/workflows/{workflow_id}/interview/stream
+
+user:
+{
+  "workflow_id": workflow_id,
+  "user_message": "你好！帮我从价格、质量、产量和供应链三个方面分析英雄牌钢笔和其他知名厂商产品"
+}
+
+assistant:
+好的，我先和你逐步确认本次竞品分析的相关信息：
+首先我初步判断你要分析的目标产品是英雄牌钢笔，产品属于硬件产品分类，你想要重点关注的分析维度是价格、质量、产量与供应链这三个部分，请问这几点的理解是正确的吗？
+
+除此之外还需要和你确认几个细节：你最多希望对比多少个竞品呢？有没有指定具体要对标分析的其他钢笔品牌，还是后续会自动为你筛选对应数量的主流知名钢笔竞品？另外你有没有其他额外的分析要求呀？
+
+user:
+{
+  "workflow_id": workflow_id,
+  "user_message": "最多对比6个，没有指定的品牌"
+}
+
+assistant:
+📋 已收集到的竞品分析配置信息如下，请你确认：
+| 配置项 | 详情 |
+| ---- | ---- |
+| 目标产品 | 英雄牌钢笔 |
+| 产品类别 | 硬件产品 |
+| 重点关注维度 | 价格、质量、产量与供应链 |
+| 最大对比竞品数量 | 6个 |
+| 指定竞品列表 | 无指定品牌，将自动筛选6个主流知名钢笔厂商作为对标对象 |
+| 额外分析要求 | 无特殊额外要求 |
+
+确认配置无误后，将按照以下规则启动分析流程：
+```json
+{
+  "target_product": "英雄牌钢笔",
+  "product_category": "硬件产品",
+  "focus_dimensions": ["价格", "质量", "产量与供应链"],
+  "competitor_count": 6,
+  "competitors": [],
+  "language": "zh",
+  "extra_requirements": "无特殊额外分析要求"
+}
+```
+---CONFIG_COMPLETE---
+

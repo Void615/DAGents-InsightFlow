@@ -1,13 +1,15 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_async_session
 from app.dependencies import get_current_user
 from app.schemas.auth import UserResponse
-from app.schemas.workflow import WorkflowCreate
+from app.schemas.workflow import WorkflowConfig, WorkflowCreate
 from app.schemas.decision import DecisionRequest
 from app.db.queries.workflow_queries import get_workflow_by_id, get_user_workflows
 from app.services.workflow_service import create_workflow, start_workflow, cancel_workflow, delete_workflow
 from app.services.sse_service import sse_manager
+from app.services.event_service import EventLogger
+from app.schemas.event import EventType
 from app.core.workflow_executor import run_workflow, resume_workflow
 from app.exceptions import WorkflowNotFoundError, InvalidStateTransitionError
 
@@ -64,11 +66,16 @@ async def get_workflow_detail(
 async def start_workflow_endpoint(
     workflow_id: str,
     background_tasks: BackgroundTasks,
+    override_config: WorkflowConfig | None = Body(default=None),
     current_user: UserResponse = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    """确认配置后启动 DAG 执行。"""
-    workflow = await start_workflow(db, workflow_id, current_user.id)
+    """确认配置后启动 DAG 执行。
+
+    可选的请求体为完整 WorkflowConfig，会覆盖访谈阶段持久化的 workflow.config，
+    使右侧面板用户编辑成为权威配置（覆盖 LLM 未提取或提取错误的字段）。
+    """
+    workflow = await start_workflow(db, workflow_id, current_user.id, override_config)
     background_tasks.add_task(run_workflow, workflow.id)
     return {"workflow_id": str(workflow.id), "status": workflow.status}
 
@@ -122,8 +129,7 @@ async def human_decide(
 ):
     """人在回路决策端点。
 
-    - resume: 从 checkpoint 继续执行（agent 建议的 target_node）
-    - jump:   从 checkpoint 恢复，使用指定的 target_node 重新执行
+    - jump:   从 checkpoint 恢复，跳转到指定 target_node 重新执行
     - approve: 强制接受当前结果，标记 completed
     - abort:   放弃执行，标记 cancelled
     """
@@ -134,6 +140,15 @@ async def human_decide(
         raise InvalidStateTransitionError(workflow_id, workflow.status, "decide")
 
     if decision.action == "approve":
+        event_logger = EventLogger(db, workflow.id, workflow.execution_attempt)
+        await event_logger.log(
+            event_type=EventType.WORKFLOW_COMPLETE,
+            payload={"approved_by_user": True},
+            node_name="__workflow__",
+        )
+        await sse_manager.broadcast(workflow.id, {
+            "event_type": EventType.WORKFLOW_COMPLETE.value,
+        })
         workflow.status = "completed"
         workflow.current_phase = "done"
         workflow.pause_state = None
@@ -142,13 +157,23 @@ async def human_decide(
         return {"workflow_id": str(workflow.id), "status": "completed", "action": "approve"}
 
     if decision.action == "abort":
+        event_logger = EventLogger(db, workflow.id, workflow.execution_attempt)
+        await event_logger.log(
+            event_type=EventType.WORKFLOW_FAILED,
+            payload={"error_code": "USER_ABORTED", "error_message": "用户手动放弃"},
+            node_name="__workflow__",
+        )
+        await sse_manager.broadcast(workflow.id, {
+            "event_type": EventType.WORKFLOW_FAILED.value,
+            "error_code": "USER_ABORTED",
+        })
         workflow.status = "cancelled"
         workflow.pause_state = None
         await db.commit()
         await sse_manager.close_workflow(workflow.id)
         return {"workflow_id": str(workflow.id), "status": "cancelled", "action": "abort"}
 
-    # resume / jump: 启动后台恢复任务
+    # jump: 启动后台恢复任务
     background_tasks.add_task(resume_workflow, workflow.id, decision)
     return {
         "workflow_id": str(workflow.id),

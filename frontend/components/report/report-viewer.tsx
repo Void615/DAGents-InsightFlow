@@ -12,7 +12,7 @@ interface Props {
 
 export function ReportViewer({ report, activeSection, onCitationClick }: Props) {
   return (
-    <div className="prose dark:prose-invert max-w-none text-sm leading-relaxed">
+    <div className="prose dark:prose-invert max-w-none leading-relaxed">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
@@ -34,14 +34,14 @@ export function ReportViewer({ report, activeSection, onCitationClick }: Props) 
               </a>
             );
           },
-          h2: ({ children, ...props }) => {
+          h2: ({ children, className = "", ...props }) => {
             const id = typeof children === "string" ? children : "";
             const isActive = activeSection === id;
             return (
               <h2
                 {...props}
                 id={id}
-                className={`scroll-mt-20 ${isActive ? "text-emerald-300" : ""}`}
+                className={`scroll-mt-20 ${isActive ? "text-emerald-300" : ""} ${className}`}
               >
                 {children}
               </h2>

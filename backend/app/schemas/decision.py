@@ -3,7 +3,6 @@ from pydantic import BaseModel, Field
 
 
 class DecisionAction(str, Enum):
-    RESUME = "resume"
     JUMP = "jump"
     APPROVE = "approve"
     ABORT = "abort"
@@ -11,5 +10,8 @@ class DecisionAction(str, Enum):
 
 class DecisionRequest(BaseModel):
     action: DecisionAction
-    target_node: str | None = Field(default=None, description="JUMP/RESUME 时指定的入口节点，覆盖 agent 的默认 target_node")
+    target_node: str | None = Field(
+        default=None,
+        description="jump 时指定跳转目标节点。为空时 fallback 到 agent 建议的 target_node",
+    )
     feedback: str = Field(default="", description="人工反馈信息")

@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useCallback } from "react";
+import { useMemo, useRef } from "react";
 import { ReactFlow, Background, Controls, type Node, type Edge, MarkerType } from "reactflow";
 import "reactflow/dist/style.css";
 import { DagNode } from "./dag-node";
+import type { DagNodeData } from "./dag-node";
 import type { AgentNodeName } from "@/types/event";
 
 const nodeTypes = { dagNode: DagNode };
@@ -24,20 +25,46 @@ interface Props {
 }
 
 export function DagCanvas({ nodeStates, hasReroute, onRetry }: Props) {
+  const dataCacheRef = useRef<Map<string, DagNodeData>>(new Map());
+
   const nodes: Node[] = useMemo(
     () =>
-      NODE_DEFINITIONS.map((def) => ({
-        id: def.id,
-        type: "dagNode",
-        position: def.position,
-        data: {
+      NODE_DEFINITIONS.map((def) => {
+        const newStatus = nodeStates[def.id]?.status ?? "idle";
+        const newMessage = nodeStates[def.id]?.message;
+        const newDuration = nodeStates[def.id]?.duration_ms;
+
+        const cached = dataCacheRef.current.get(def.id);
+        if (
+          cached &&
+          cached.status === newStatus &&
+          cached.message === newMessage &&
+          cached.duration_ms === newDuration
+        ) {
+          return {
+            id: def.id,
+            type: "dagNode",
+            position: def.position,
+            data: cached,
+          };
+        }
+
+        const newData: DagNodeData = {
           label: def.label,
-          status: nodeStates[def.id]?.status || "idle",
-          message: nodeStates[def.id]?.message,
-          duration_ms: nodeStates[def.id]?.duration_ms,
+          status: newStatus,
+          message: newMessage,
+          duration_ms: newDuration,
           onRetry: onRetry ? () => onRetry(def.id) : undefined,
-        },
-      })),
+        };
+        dataCacheRef.current.set(def.id, newData);
+
+        return {
+          id: def.id,
+          type: "dagNode",
+          position: def.position,
+          data: newData,
+        };
+      }),
     [nodeStates, onRetry]
   );
 
@@ -71,7 +98,7 @@ export function DagCanvas({ nodeStates, hasReroute, onRetry }: Props) {
 
   return (
     <div className="h-full w-full rounded-2xl border border-[var(--border)] bg-dot-grid overflow-hidden">
-      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} fitView preventScrolling={false}>
+      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} defaultViewport={{ x: 0, y: 0, zoom: 1 }} preventScrolling={false}>
         <Background color="var(--border)" gap={24} size={1} />
         <Controls className="[&>button]:!bg-[var(--bg-card)] [&>button]:!border-[var(--border)] [&>button]:!text-[var(--text-secondary)] [&>button]:!rounded-lg" />
       </ReactFlow>
