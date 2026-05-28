@@ -37,6 +37,7 @@ downloads/
 eggs/
 .eggs/
 lib64/
+!frontend/lib/
 parts/
 sdist/
 var/
@@ -237,3 +238,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project docs
+Technical Design Document.md
+Git 协作约定.md
+Official Documentation.md
+report/
+!frontend/components/report/
