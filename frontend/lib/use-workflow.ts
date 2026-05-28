@@ -3,7 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import api from "./api";
 import type { WorkflowCreate, WorkflowListItem } from "@/types/api";
-import type { WorkflowDetail } from "@/types/workflow";
+import type { WorkflowConfig, WorkflowDetail } from "@/types/workflow";
 
 export function useWorkflows() {
   return useQuery<WorkflowListItem[]>({
@@ -23,6 +23,9 @@ export function useWorkflow(id: string) {
       return res.data;
     },
     enabled: !!id,
+    // 运行中 15s 轮询兜底 SSE 丢失（如 workflow_complete 未到达），终态自动停止
+    refetchInterval: (query) => (query.state.data?.status === "running" ? 15_000 : false),
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -54,11 +57,15 @@ export function useDeleteWorkflow() {
 export function useStartWorkflow() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: async (id: string) => {
-      const res = await api.post(`/workflows/${id}/start`);
+    mutationFn: async ({ id, config }: { id: string; config?: Partial<WorkflowConfig> }) => {
+      // 可选 config body：让右侧面板用户编辑成为权威配置（覆盖 workflow.config）
+      // 显式分支避免 axios 在 body=undefined 时仍发送 Content-Type 头
+      const res = config
+        ? await api.post(`/workflows/${id}/start`, config)
+        : await api.post(`/workflows/${id}/start`);
       return res.data;
     },
-    onSuccess: (_data, id) => {
+    onSuccess: (_data, { id }) => {
       qc.invalidateQueries({ queryKey: ["workflow", id] });
       qc.invalidateQueries({ queryKey: ["workflows"] });
     },

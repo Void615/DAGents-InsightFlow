@@ -479,6 +479,3 @@ assistant:
 ```
 ---CONFIG_COMPLETE---
 
-### 开始 workflow
-
-1. 

@@ -338,3 +338,53 @@ Interview 阶段 LLM 输出 `---CONFIG_COMPLETE---` 后，前端有时无法跳�
 
 - **僵死检测仅前端**：服务重启后僵死工作流仅前端展示警告，无后端自动恢复机制。后续可在后端增加启动时扫描 `running` 工作流并按 checkpoint 自动 resume 的逻辑。
 - **/decide 成功后的 UI 刷新**：决策提交后通过 SSE `workflow_resumed` / `node_start` 事件驱动 UI 更新，而非主动刷新 workflow 查询。若 SSE 连接延迟，暂停卡片可能短暂保持显示。后续可加 `router.refresh()` 强制刷新。
+
+---
+
+### 14. 修复 CHANGELOG #13 未生效 + Interview 配置健壮性 + 多项 latent bug
+
+#### 修复方案
+
+第 13 条添加的工作流重进入恢复机制**完全未生效**——根因是前后端契约不一致：后端 `GET /events` 返回 `{items, total, limit, offset}` 分页信封，前端假设是裸数组，`Array.isArray(body) === false` 直接 early-return，整段历史回放代码（包括 nodeStates 重建与僵死检测）都是死代码。本条同时修复了 interview 配置流的多个结构性问题，并清理了 CHANGELOG #8 / #12 留下的 latent bug。
+
+**Section A — 前端恢复机制**
+
+- **`/events` 响应形状兼容**：`DagRuntimeView` 的 replay `useEffect` 接受 `{items}` 信封与裸数组两种形状，兼容现有后端契约并对未来改动免疫。**这是让 #13 真正生效的关键 fix**。
+- **InterviewView 重进入水合**：将 `config` / `isComplete` 从 `useState({})` 改为 `useState(() => fromWorkflow(workflow.config))` 懒初始化，重新打开工作流时右侧面板立即恢复已收集字段；若 `target_product + product_category` 均已存在则视为"可直接启动"，无需用户重新发送一条访谈消息触发 META。
+- **解锁 isComplete 后的输入框**：textarea / send 按钮 disabled 条件从 `isComplete || isStreaming` 改为仅 `isStreaming`；`sendUserMessage` guard 同步去掉 `isComplete` 检查；`ConfigPanel` 新增"继续编辑访谈" ghost 按钮，让用户在配置不满意时仍能继续修订。
+- **路由 switch 补齐 `created` + 未知 status fallback**：`created` 视为 configuring 入口；`workflow == null` 渲染"工作流不存在"卡片；未知 status 渲染调试卡片 + 刷新按钮（避免任何 enum 演进时出现整页空白）。
+- **`handleDecide` 失效 workflow 查询**：成功路径后调用 `qc.invalidateQueries({queryKey: ["workflow", id]})`，approve→ReportView / jump→running view 切换不再依赖 SSE 到达。
+- **ReportView token 一致性**：3 处 `localStorage.getItem("access_token")` 替换为 `useAuth().token`，与 InterviewView / DagRuntimeView 对齐，登出/换 token 时不会读到过期凭证。`ReportView` 内部对 `/events` 端点的另一次调用同步接受 `{items}` 信封。
+
+**Section B — Interview 配置可靠性**
+
+- **`/start` 错误内联回显**：`handleStart` 用 try/catch 捕获，提取 `response.data.detail` 渲染为 rose 色提示（之前完全静默）。配置编辑时自动清空错误。
+- **本地 canStart 校验 gate**：`Boolean(target_product && product_category)` 才允许点击 Start。按钮 disabled 时提示"请先补全产品名称和品类"。
+- **`/start` 接受可选 config body**（前后端）：`useStartWorkflow.mutationFn` 改为 `({id, config})`，POST body 为完整 `WorkflowConfig`；后端 `start_workflow_endpoint` 接受可选 `WorkflowConfig | None = Body(default=None)`，service 层在状态校验前用其覆盖 `workflow.config`（`flag_modified` 标记 JSON 列变更）。**让右侧面板用户编辑成为权威配置**，即使 LLM 完全未提取 JSON 也能启动。`ConfigPanel` Start 渲染条件从 `isComplete` 放宽为 `isComplete || canStart`，允许无 sentinel 也可启动。
+
+**Section C — Latent bug 与其他优化**
+
+- **`pause_state.dag_state` 持久化（修 CHANGELOG #8 的死代码）**：`workflow_executor.py` 两处持久化点（run_workflow + resume_workflow）都加上 `dag_state: pause_data.get("dag_state", {})`。原代码显式丢弃这个字段但 `resume_workflow:205-206` 又试图从中读 `review_result`，使 `cached_review_result` 永远为 None——CHANGELOG #8 的"跳过 review LLM 重跑"优化是死代码。同时修了 `resume_workflow` 在清空 `pause_state` **之前**就读 `dag_state` 的顺序——之前因为 `pause_state = None` 已经先执行，`dag_state` 永远是 `{}`（即使 C1 持久化也读不到）。现在引入 `dag_state_before` / `paused_by_node_before` 快照变量，在 commit 前抓取。
+- **running 状态 polling 兜底**：`useWorkflow` 新增 `refetchInterval: (q) => q.state.data?.status === "running" ? 15_000 : false` + `refetchOnWindowFocus: true`。SSE 丢失 `workflow_complete` 时 15s 内仍能切到 ReportView，终态自动停止轮询。
+- **`WorkflowDetail` 类型对齐后端**：移除从未填充的 `progress`（含 `phases.collecting` 等死字段）和 `PhaseStatus`；新增 `max_revisions`、`total_tokens`、`error_message`、`completed_at`、`pause_state.dag_state`；`config` 类型放宽为 `Partial<WorkflowConfig>` 反映 JSON 列可能为部分配置的现实。
+- **`try_extract_config` 平衡括号扫描**：`_parse_json_block` 的 `find("{")` + `rfind("}")` 在 LLM 回复中含对话性大括号（如 `{user_name}`、模板占位符）时会跨越正确的 JSON 边界，导致 `json.loads` 失败。新增 `_iter_balanced_json_blocks` 工具方法，逐字符维护括号深度计数器（正确处理字符串字面量与转义），yield 所有顶层 `{...}` 子串；`try_extract_config` 优先 markdown fence，否则取**最后一个**通过 Pydantic 校验的 block（LLM 通常先草拟再给最终配置）。
+
+#### 修改的文件
+
+- `frontend/app/workflows/[id]/page.tsx` — A1/A2/A3/A4/A5/A6/B1/B2/B3
+- `frontend/components/interview/config-panel.tsx` — 新增 `canStart` / `startError` / `onResumeEditing` props；Start gating 改为 `(isComplete || canStart)`；新增 caption 与"继续编辑访谈" ghost 按钮；inline 错误回显
+- `frontend/lib/use-workflow.ts` — `useStartWorkflow.mutationFn` 改为 `({id, config})`；`useWorkflow` 新增 `refetchInterval` / `refetchOnWindowFocus`
+- `frontend/types/workflow.ts` — 移除 `PhaseStatus` 与 `WorkflowDetail.progress`，补齐 `max_revisions`/`total_tokens`/`error_message`/`completed_at`/`pause_state.dag_state`
+- `backend/app/api/v1/workflow.py` — `start_workflow_endpoint` 接受可选 `WorkflowConfig | None = Body(default=None)`
+- `backend/app/services/workflow_service.py` — `start_workflow` 增加 `override_config` 形参，使用 `flag_modified` 标记 JSON 列变更
+- `backend/app/core/workflow_executor.py` — 两处 `pause_state` 持久化点新增 `dag_state` 字段；`resume_workflow` 在 commit 前快照 `dag_state_before` / `paused_by_node_before`
+- `backend/app/agents/interview_agent.py` — 新增 `_iter_balanced_json_blocks`；`_parse_json_block` 与 `try_extract_config` 重写采用平衡扫描 + Pydantic 校验
+
+#### 可能的潜在问题
+
+- **InterviewView 懒水合不响应 server.config 更新**：另一个 tab 完成访谈后回到本 tab，新的 `workflow.config` 不会被本 tab 拿来覆盖本地状态。这是有意设计（保护用户编辑），但若两个 tab 同时操作可能出现配置漂移。后续可加版本号 / mtime 检测，或在 useWorkflow 刷新时显式提示用户合并。
+- **handleDecide 后立即 invalidate 可能撞上后端事务延迟**：jump 路径是 BG task，invalidate 触发的 refetch 可能仍读到 `status=paused`，UI 短暂停留在暂停卡片。SSE 到达后自然刷新。可接受。
+- **`pause_state.dag_state` 可能撑大 JSON 列**：当前 `_sanitize_for_json` 已剥离 `messages`，但 `raw_data`（采集到的搜索原文）会一并写入。PostgreSQL JSON 列单行无硬上限但查询会变慢。后续可在 sanitize 中再去掉 `raw_data` 字段，仅保留 review/report 结构化结果。
+- **`try_extract_config` 取最后一个有效 block 的策略可能误判**：若 LLM 在确认配置后又继续输出其他不相关 JSON（罕见），会取后者。`---CONFIG_COMPLETE---` 哨兵 + markdown fence 优先策略仍是首选保护层。
+- **`override_config` 信任前端**：前端可发任意合法 `WorkflowConfig` 覆盖访谈结果。当前权限模型下用户只能操作自己的 workflow，影响可控；后续若引入团队/审批流需要重新评估。
+

@@ -112,6 +112,9 @@ async def run_workflow(workflow_id: uuid.UUID) -> None:
                 "pause_reason": pause_data.get("pause_reason", ""),
                 "pause_options": pause_data.get("pause_options", []),
                 "pause_context": pause_data.get("pause_context", {}),
+                # 保留 dag_state（graph_nodes 已 _sanitize_for_json 剥离 messages 等大字段）
+                # resume 时读取其中的 review_result 作为 cached_review_result，避免 LLM 重跑
+                "dag_state": pause_data.get("dag_state", {}),
                 "paused_at": datetime.now(timezone.utc).isoformat(),
             }
             await db.commit()
@@ -174,6 +177,11 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
         event_logger = EventLogger(db, workflow_id, workflow.execution_attempt)
         checkpointer = await get_checkpointer()
 
+        # 在清空 pause_state 之前先快照 paused_by_node 和 dag_state，
+        # 否则下方 cached_review_result 永远是 None（C1 的本意）
+        paused_by_node_before = (workflow.pause_state or {}).get("paused_by_node")
+        dag_state_before = (workflow.pause_state or {}).get("dag_state", {})
+
         workflow.status = "running"
         if decision.action == "jump":
             workflow.pause_state = None
@@ -201,9 +209,9 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
             )
             config = {"configurable": {"thread_id": str(workflow_id)}}
 
-            # 从 pause_state 提取缓存的 review_result，避免 resume 时重复 LLM 调用
-            dag_state = (workflow.pause_state or {}).get("dag_state", {})
-            cached_review_result = dag_state.get("review_result") if decision.action == "jump" else None
+            # 从 pause_state 快照（commit 前已保存）提取缓存的 review_result，
+            # 避免 resume 时 ReviewAgent 重跑 LLM
+            cached_review_result = dag_state_before.get("review_result") if decision.action == "jump" else None
 
             # 发出通用 REROUTE 事件
             if decision.action == "jump":
@@ -214,7 +222,7 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
                     await event_logger.log(
                         event_type=EventType.REROUTE,
                         payload={
-                            "from_node": (workflow.pause_state or {}).get("paused_by_node"),
+                            "from_node": paused_by_node_before,
                             "to_node": target,
                             "trigger": "human_jump" if decision.target_node else "agent_suggestion",
                             "feedback": decision.feedback,
@@ -223,7 +231,7 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
                     )
                     await sse_manager.broadcast(workflow_id, {
                         "event_type": EventType.REROUTE.value,
-                        "from_node": (workflow.pause_state or {}).get("paused_by_node"),
+                        "from_node": paused_by_node_before,
                         "to_node": target,
                         "trigger": "human_jump" if decision.target_node else "agent_suggestion",
                     })
@@ -263,6 +271,8 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
                 "pause_reason": pause_data.get("pause_reason", ""),
                 "pause_options": pause_data.get("pause_options", []),
                 "pause_context": pause_data.get("pause_context", {}),
+                # 同 run_workflow：保留 dag_state 供下一次 resume 复用 cached_review_result
+                "dag_state": pause_data.get("dag_state", {}),
                 "paused_at": datetime.now(timezone.utc).isoformat(),
             }
             await db.commit()

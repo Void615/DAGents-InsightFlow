@@ -1,9 +1,9 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_async_session
 from app.dependencies import get_current_user
 from app.schemas.auth import UserResponse
-from app.schemas.workflow import WorkflowCreate
+from app.schemas.workflow import WorkflowConfig, WorkflowCreate
 from app.schemas.decision import DecisionRequest
 from app.db.queries.workflow_queries import get_workflow_by_id, get_user_workflows
 from app.services.workflow_service import create_workflow, start_workflow, cancel_workflow, delete_workflow
@@ -66,11 +66,16 @@ async def get_workflow_detail(
 async def start_workflow_endpoint(
     workflow_id: str,
     background_tasks: BackgroundTasks,
+    override_config: WorkflowConfig | None = Body(default=None),
     current_user: UserResponse = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    """确认配置后启动 DAG 执行。"""
-    workflow = await start_workflow(db, workflow_id, current_user.id)
+    """确认配置后启动 DAG 执行。
+
+    可选的请求体为完整 WorkflowConfig，会覆盖访谈阶段持久化的 workflow.config，
+    使右侧面板用户编辑成为权威配置（覆盖 LLM 未提取或提取错误的字段）。
+    """
+    workflow = await start_workflow(db, workflow_id, current_user.id, override_config)
     background_tasks.add_task(run_workflow, workflow.id)
     return {"workflow_id": str(workflow.id), "status": workflow.status}
 

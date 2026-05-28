@@ -1,12 +1,11 @@
 "use client";
 
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { motion, AnimatePresence } from "framer-motion";
-import { Check, Loader2, Plus, X, ChevronDown } from "lucide-react";
+import { Check, Plus, X, ChevronDown, Pencil } from "lucide-react";
 import { useState } from "react";
 import type { WorkflowConfig } from "@/types/workflow";
 
@@ -15,11 +14,17 @@ interface Props {
   isComplete: boolean;
   isStarting: boolean;
   newCompetitor: string;
+  /** 本地校验：target_product + product_category 是否都已填写 */
+  canStart: boolean;
+  /** 后端 /start 失败信息（如 ConfigIncompleteError 等），非 null 时高亮显示 */
+  startError: string | null;
   onNewCompetitorChange: (v: string) => void;
   onAddCompetitor: () => void;
   onRemoveCompetitor: (name: string) => void;
   onConfigChange: (field: string, value: unknown) => void;
   onStart: () => void;
+  /** 解锁访谈对话（isComplete 翻回 false），用于配置不满意时继续修订 */
+  onResumeEditing: () => void;
 }
 
 export function ConfigPanel({
@@ -27,11 +32,14 @@ export function ConfigPanel({
   isComplete,
   isStarting,
   newCompetitor,
+  canStart,
+  startError,
   onNewCompetitorChange,
   onAddCompetitor,
   onRemoveCompetitor,
   onConfigChange,
   onStart,
+  onResumeEditing,
 }: Props) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const toggle = (k: string) => setCollapsed((p) => ({ ...p, [k]: !p[k] }));
@@ -129,8 +137,16 @@ export function ConfigPanel({
         </FieldSection>
       </div>
 
+      {/* /start 错误内联回显 */}
+      {startError && (
+        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+          {startError}
+        </div>
+      )}
+
       <AnimatePresence>
-        {isComplete && (
+        {/* 显示 Start 按钮的条件：LLM 已发出完成哨兵，或本地校验已通过（允许无 sentinel 也能启动） */}
+        {(isComplete || canStart) && (
           <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
@@ -139,8 +155,8 @@ export function ConfigPanel({
           >
             <Button
               onClick={onStart}
-              disabled={isStarting}
-              className="w-full py-5 text-sm font-semibold rounded-2xl bg-emerald-500 hover:bg-emerald-600 text-white shadow-[0_0_24px_var(--accent-glow)] transition-all duration-300 hover:shadow-[0_0_36px_var(--accent-glow)]"
+              disabled={isStarting || !canStart}
+              className="w-full py-5 text-sm font-semibold rounded-2xl bg-emerald-500 hover:bg-emerald-600 text-white shadow-[0_0_24px_var(--accent-glow)] transition-all duration-300 hover:shadow-[0_0_36px_var(--accent-glow)] disabled:bg-zinc-700 disabled:shadow-none disabled:cursor-not-allowed"
             >
               {isStarting ? (
                 <span className="flex items-center gap-2"><Spinner size={14} /> 启动 LangGraph 引擎...</span>
@@ -148,6 +164,20 @@ export function ConfigPanel({
                 <span className="flex items-center gap-2"><Check size={16} /> 确认配置并启动分析</span>
               )}
             </Button>
+            {!canStart && (
+              <p className="text-[11px] text-amber-400/80 text-center">
+                请先补全产品名称和品类
+              </p>
+            )}
+            {isComplete && (
+              <Button
+                variant="ghost"
+                onClick={onResumeEditing}
+                className="w-full h-8 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+              >
+                <Pencil size={12} className="mr-1" /> 继续编辑访谈
+              </Button>
+            )}
           </motion.div>
         )}
       </AnimatePresence>

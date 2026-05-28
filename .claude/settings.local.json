@@ -32,7 +32,12 @@
       "Bash(E:/env/miniconda3/envs/insightflow/python.exe -m pytest backend/tests/test_human_in_the_loop.py -v)",
       "Bash(npm install *)",
       "Bash(npx tsc *)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(echo \"tsc exit: $?\")",
+      "Bash(./node_modules/.bin/tsc --noEmit)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(./node_modules/.bin/next lint *)",
+      "Bash(grep -A 2 \"page\\\\.tsx$\")"
     ]
   }
 }

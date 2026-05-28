@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useParams } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "@/lib/auth-context";
 import { useWorkflow, useStartWorkflow } from "@/lib/use-workflow";
 import { useInterviewHistory } from "@/lib/use-interview";
@@ -39,6 +40,7 @@ import type { TraceLink } from "@/types/trace";
 export default function WorkflowStudioPage() {
   const { id } = useParams<{ id: string }>();
   const { token } = useAuth();
+  const qc = useQueryClient();
   const { data: workflow, isLoading } = useWorkflow(id);
   const status = workflow?.status;
 
@@ -52,16 +54,48 @@ export default function WorkflowStudioPage() {
     );
   }
 
+  // 加载完成但未获取到 workflow（404 / 无权限）
+  if (!workflow) {
+    return (
+      <AuthGuard>
+        <div className="flex h-screen items-center justify-center" style={{ backgroundColor: "var(--bg-primary)" }}>
+          <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-6 py-4 text-center max-w-md">
+            <p className="text-sm text-rose-300">工作流不存在或无访问权限</p>
+            <Link href="/dashboard" className="mt-3 inline-block text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)] underline">
+              返回仪表板
+            </Link>
+          </div>
+        </div>
+      </AuthGuard>
+    );
+  }
+
+  // 状态路由：created 视为 configuring 入口；未知 status 渲染 fallback
+  const isInterviewStage = status === "configuring" || status === "created";
+  const isRuntimeStage = status === "running" || status === "paused";
+  const isTerminalStage = status === "completed" || status === "failed" || status === "cancelled";
+
   return (
     <AuthGuard>
       <div className="min-h-screen" style={{ backgroundColor: "var(--bg-primary)" }}>
         <Header workflow={workflow} />
-        {status === "configuring" && <InterviewView workflowId={id} token={token!} />}
-        {(status === "running" || status === "paused") && (
-          <DagRuntimeView workflowId={id} token={token!} workflow={workflow!} />
-        )}
-        {(status === "completed" || status === "failed" || status === "cancelled") && (
-          <ReportView workflowId={id} workflowStatus={status!} />
+        {isInterviewStage && <InterviewView workflowId={id} token={token!} workflow={workflow} />}
+        {isRuntimeStage && <DagRuntimeView workflowId={id} token={token!} workflow={workflow} />}
+        {isTerminalStage && <ReportView workflowId={id} workflowStatus={status!} />}
+        {!isInterviewStage && !isRuntimeStage && !isTerminalStage && (
+          <div className="flex h-[calc(100vh-57px)] items-center justify-center">
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-6 py-4 text-center max-w-md space-y-3">
+              <p className="text-sm text-amber-300">无法识别的工作流状态: <code className="bg-black/30 px-1 rounded">{String(status)}</code></p>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => qc.invalidateQueries({ queryKey: ["workflow", id] })}
+                className="text-xs"
+              >
+                刷新状态
+              </Button>
+            </div>
+          </div>
         )}
       </div>
     </AuthGuard>
@@ -92,13 +126,23 @@ function Header({ workflow }: { workflow: { title?: string; status?: string; cur
 }
 
 /* ─── Interview View ─── */
-function InterviewView({ workflowId, token }: { workflowId: string; token: string }) {
+function InterviewView({ workflowId, token, workflow }: { workflowId: string; token: string; workflow: WorkflowDetail }) {
+  // 重进入水合：useState 懒初始化从 workflow.config 一次性恢复右侧面板和 isComplete，
+  // 之后用户编辑或 SSE 增量不会被后续 useWorkflow 重取数据覆盖
+  const [config, setConfig] = useState<Partial<WorkflowConfig>>(() => {
+    const sc = workflow.config as Partial<WorkflowConfig> | undefined;
+    return sc && Object.keys(sc).length > 0 ? { ...sc } : {};
+  });
+  const [isComplete, setIsComplete] = useState<boolean>(() => {
+    const sc = workflow.config as Partial<WorkflowConfig> | undefined;
+    // target_product + product_category 都已存在视为"可直接启动"
+    return Boolean(sc?.target_product && sc?.product_category);
+  });
   const [messages, setMessages] = useState<InterviewMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
-  const [isComplete, setIsComplete] = useState(false);
-  const [config, setConfig] = useState<Partial<WorkflowConfig>>({});
   const [newCompetitor, setNewCompetitor] = useState("");
-  const { sendMessage, cancel, isStreaming } = useInterviewStream({ workflowId, token });
+  const [startError, setStartError] = useState<string | null>(null);
+  const { sendMessage, isStreaming } = useInterviewStream({ workflowId, token });
   const startMutation = useStartWorkflow();
   const { data: history } = useInterviewHistory(workflowId);
 
@@ -108,8 +152,11 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
     }
   }, [history]);
 
+  // 本地校验：target_product + product_category 必须都存在
+  const canStart = Boolean(config.target_product && config.product_category);
+
   const sendUserMessage = (text: string) => {
-    if (!text.trim() || isStreaming || isComplete) return;
+    if (!text.trim() || isStreaming) return;
     const userMsg: InterviewMessage = { role: "user", content: text, created_at: new Date().toISOString() };
     setMessages((prev) => [...prev, userMsg, { role: "assistant", content: "", created_at: new Date().toISOString() }]);
     setInputValue("");
@@ -148,15 +195,37 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
 
   const handleSend = () => sendUserMessage(inputValue);
   const handleQuickReply = (text: string) => sendUserMessage(text);
-
-  const handleStart = async () => {
-    await startMutation.mutateAsync(workflowId);
+  // 解锁继续编辑：让用户在 isComplete=true 后还能继续访谈来修订
+  const handleResumeEditing = () => {
+    setIsComplete(false);
+    setStartError(null);
   };
 
-  // Safety net: when interview completes, pull final config from backend
-  // in case the stream's meta block had extracted_config=null
+  const handleStart = async () => {
+    setStartError(null);
+    if (!canStart) {
+      setStartError("配置不完整：target_product 和 product_category 必填");
+      return;
+    }
+    try {
+      // 将右侧面板编辑的 config 作为权威配置传给后端
+      await startMutation.mutateAsync({ id: workflowId, config });
+    } catch (err) {
+      const detail =
+        (err as { response?: { data?: { detail?: string; message?: string } } })?.response?.data?.detail
+        || (err as { response?: { data?: { detail?: string; message?: string } } })?.response?.data?.message
+        || (err as Error).message
+        || "启动失败";
+      setStartError(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+  };
+
+  // 用户编辑右侧面板时清空 startError，避免误导
+  const clearStartError = () => { if (startError) setStartError(null); };
+
+  // 安全网：isComplete 翻转但 config 仍空时，从后端拉一次（兼容旧 META 路径）
   useEffect(() => {
-    if (!isComplete) return;
+    if (!isComplete || canStart) return;
     const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
     fetch(`${baseUrl}/workflows/${workflowId}`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -168,7 +237,7 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
         }
       })
       .catch(() => {});
-  }, [isComplete, workflowId, token]);
+  }, [isComplete, canStart, workflowId, token]);
 
   return (
     <div className="flex h-[calc(100vh-57px)]" style={{ backgroundColor: "var(--bg-primary)" }}>
@@ -193,12 +262,12 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
                   handleSend();
                 }
               }}
-              placeholder={isComplete ? "配置已锁定，请在右侧确认启动..." : "输入回复，或点击上方的选项卡片快速选择... (Enter 发送，Shift+Enter 换行)"}
-              disabled={isComplete || isStreaming}
+              placeholder={isStreaming ? "AI 正在回复中..." : "输入回复，或继续追问以完善配置... (Enter 发送，Shift+Enter 换行)"}
+              disabled={isStreaming}
               rows={1}
               className="flex-1 resize-none rounded-2xl border border-[var(--border)] bg-[var(--bg-elevated)] px-4 py-2.5 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 focus-visible:border-emerald-500/50 disabled:opacity-50 transition-all"
             />
-            <Button onClick={handleSend} disabled={isComplete || isStreaming} variant="primary" size="icon" className="rounded-xl">
+            <Button onClick={handleSend} disabled={isStreaming} variant="primary" size="icon" className="rounded-xl">
               <Send size={16} />
             </Button>
           </div>
@@ -210,6 +279,8 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
           isComplete={isComplete}
           isStarting={startMutation.isPending}
           newCompetitor={newCompetitor}
+          canStart={canStart}
+          startError={startError}
           onNewCompetitorChange={setNewCompetitor}
           onAddCompetitor={() => {
             if (newCompetitor.trim()) {
@@ -218,16 +289,22 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
                 competitors: [...(prev.competitors ?? []), newCompetitor.trim()],
               }));
               setNewCompetitor("");
+              clearStartError();
             }
           }}
-          onRemoveCompetitor={(name) =>
+          onRemoveCompetitor={(name) => {
             setConfig((prev) => ({
               ...prev,
               competitors: (prev.competitors ?? []).filter((c) => c !== name),
-            }))
-          }
-          onConfigChange={(field, value) => setConfig((prev) => ({ ...prev, [field]: value }))}
+            }));
+            clearStartError();
+          }}
+          onConfigChange={(field, value) => {
+            setConfig((prev) => ({ ...prev, [field]: value }));
+            clearStartError();
+          }}
           onStart={handleStart}
+          onResumeEditing={handleResumeEditing}
         />
       </div>
     </div>
@@ -236,6 +313,7 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
 
 /* ─── DAG Runtime View ─── */
 function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; token: string; workflow: WorkflowDetail }) {
+  const qc = useQueryClient();
   const isPaused = workflow.status === "paused";
   const [nodeStates, setNodeStates] = useState<
     Record<AgentNodeName, { status: NodeStatus; message?: string; duration_ms?: number }>
@@ -349,6 +427,9 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
         content: `已提交决策: ${action === "jump" ? `重试 ${targetNode || ""}` : action === "approve" ? "强制通过" : "放弃"}`,
         time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
       }]);
+      // 失效 workflow 缓存：approve→completed / abort→cancelled / jump→running 切换不依赖 SSE 到达
+      qc.invalidateQueries({ queryKey: ["workflow", workflowId] });
+      qc.invalidateQueries({ queryKey: ["workflows"] });
     } catch (err) {
       setDecideError((err as Error).message || "决策提交失败");
     } finally {
@@ -363,9 +444,11 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.json())
-      .then((history: WorkflowEvent[]) => {
-        if (!Array.isArray(history)) return;
-        const sorted = [...history].sort((a, b) => a.seq - b.seq);
+      .then((body: { items?: WorkflowEvent[] } | WorkflowEvent[]) => {
+        // 后端返回 {items, total, limit, offset} 分页信封；兼容裸数组以防契约变动
+        const list: WorkflowEvent[] = Array.isArray(body) ? body : (body?.items ?? []);
+        if (list.length === 0) return;
+        const sorted = [...list].sort((a, b) => a.seq - b.seq);
         const rebuilt: Record<AgentNodeName, { status: NodeStatus; message?: string; duration_ms?: number }> = {
           information_collection: { status: "idle" },
           analysis: { status: "idle" },
@@ -529,6 +612,7 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
 
 /* ─── Report View ─── */
 function ReportView({ workflowId, workflowStatus }: { workflowId: string; workflowStatus: string }) {
+  const { token } = useAuth();
   const { data: artifactList } = useArtifacts(workflowId);
   const [fullArtifacts, setFullArtifacts] = useState<Record<string, unknown>>({});
   const [activeCitation, setActiveCitation] = useState<number | null>(null);
@@ -539,9 +623,8 @@ function ReportView({ workflowId, workflowStatus }: { workflowId: string; workfl
 
   // Load report content
   useEffect(() => {
-    if (!reportId) return;
+    if (!reportId || !token) return;
     const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
-    const token = localStorage.getItem("access_token");
     fetch(`${baseUrl}/artifacts/${reportId}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
@@ -550,13 +633,12 @@ function ReportView({ workflowId, workflowStatus }: { workflowId: string; workfl
         setFullArtifacts((prev) => ({ ...prev, report: d.content }));
       })
       .catch(console.error);
-  }, [reportId]);
+  }, [reportId, token]);
 
   // Load structured analysis artifacts
   useEffect(() => {
-    if (!artifactList) return;
+    if (!artifactList || !token) return;
     const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
-    const token = localStorage.getItem("access_token");
     const analysisTypes = ["feature_matrix", "pricing_comparison", "user_sentiment", "swot_analysis"];
     analysisTypes.forEach((type) => {
       const art = artifactList.find((a) => a.artifact_type === type);
@@ -570,7 +652,7 @@ function ReportView({ workflowId, workflowStatus }: { workflowId: string; workfl
         })
         .catch(console.error);
     });
-  }, [artifactList]);
+  }, [artifactList, token]);
 
   const { data: traceLinks } = useTraceLinks(workflowId, workflowStatus === "completed");
 
@@ -582,13 +664,14 @@ function ReportView({ workflowId, workflowStatus }: { workflowId: string; workfl
 
   useEffect(() => {
     if (workflowStatus !== "completed" && workflowStatus !== "failed") return;
+    if (!token) return;
     const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
-    const token = localStorage.getItem("access_token");
     fetch(`${baseUrl}/workflows/${workflowId}/events?event_type=review_pass&event_type=review_fail&event_type=review_reroute`, {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.json())
-      .then((events: Array<{ event_type: string; payload: { score?: number; target_node?: string; feedback?: string }; iteration: number }>) => {
+      .then((body: { items?: Array<{ event_type: string; payload: { score?: number; target_node?: string; feedback?: string }; iteration: number }> } | Array<{ event_type: string; payload: { score?: number; target_node?: string; feedback?: string }; iteration: number }>) => {
+        const events = Array.isArray(body) ? body : (body?.items ?? []);
         const revs: Array<{ number: number; passed: boolean; targetNode?: string; score?: number }> = [];
         for (const e of events) {
           if (e.event_type === "review_pass") {
@@ -605,7 +688,7 @@ function ReportView({ workflowId, workflowStatus }: { workflowId: string; workfl
       .catch(() => {
         if (workflowStatus === "completed") setRevisions([{ number: 1, passed: true }]);
       });
-  }, [workflowId, workflowStatus]);
+  }, [workflowId, workflowStatus, token]);
 
   return (
     <div className="h-[calc(100vh-57px)] flex flex-col">
