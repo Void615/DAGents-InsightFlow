@@ -29,7 +29,10 @@
       "Bash(\"E:/env/miniconda3/envs/insightflow/python.exe\" -m pytest tests/test_human_in_the_loop.py -v --tb=short)",
       "Bash(\"E:/env/miniconda3/envs/insightflow/python.exe\" -m pytest tests/test_human_in_the_loop.py::TestReviewAgentRuleBased -v --tb=short)",
       "Bash(\"E:/env/miniconda3/envs/insightflow/python.exe\" -m pytest tests/test_human_in_the_loop.py -q)",
-      "Bash(E:/env/miniconda3/envs/insightflow/python.exe -m pytest backend/tests/test_human_in_the_loop.py -v)"
+      "Bash(E:/env/miniconda3/envs/insightflow/python.exe -m pytest backend/tests/test_human_in_the_loop.py -v)",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(npm run *)"
     ]
   }
 }

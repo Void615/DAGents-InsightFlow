@@ -220,3 +220,29 @@
 
 - **缓存仅覆盖 review 节点**：当前 `cached_review_result` 机制专门针对 review 节点的 LLM 跳过。若未来其他节点（如 analysis、report）也加入 `__pause__` 并在 resume 时需要跳过重复 LLM 调用，需要为该节点添加类似的缓存 key 和跳过逻辑
 - **Router 依赖 agent 配合**：`_pause_router` 的 fallback 分支（agent 建议 target_node）当前只检查 `state["review_result"]`。若未来其他 agent 也需要建议 target_node，需在 router 中增加对应的 state key 检查，或建立统一的 state 字段约定
+
+---
+
+## 2026-05-28
+
+### 9. 前端 Markdown 渲染与 DAG 画布稳定性修复
+
+#### 修复方案
+
+- **Markdown 渲染**：安装 `@tailwindcss/typography` 插件并在 `globals.css` 注册 `@plugin` 指令。Tailwind v4 默认不含 typography 插件，导致 chat-stream 和 report-viewer 中所有 `prose-*` 类均为空操作。插件激活后已写的 prose 类自动生效，同时添加防御性回退样式（h1-h4/p/ul/ol/li/blockquote）防止插件加载失败时完全无样式。
+- **DAG 节点消失**：四个改动联合修复 — (1) `handleEvent` 加事件白名单守卫，tool_call/llm_request 等无关 SSE 事件不再触发 `setNodeStates`，减少约 70% 无效 re-render；(2) `dag-canvas.tsx` 使用 `useRef` 缓存每个 node 的 data 对象，仅在 status/message/duration_ms 实际变化时创建新引用，使 `DagNode` 的 `React.memo` 真正跳过未变化节点的渲染；(3) 移除 ReactFlow 的 `fitView` prop，消除流式更新时的视口跳动；改为 `defaultViewport` 静态定位；(4) `setHasReroute` 从 `setNodeStates` updater 内部移到外部，消除 React 反模式。
+- **报告样式**：移除 `report-viewer.tsx` 外层 `text-sm`（不再压制标题字号）；修复 `h2` 自定义组件的 `className` 合并逻辑（原来直接覆盖导致 prose 插件生成的字号/粗细/边距丢失）。
+
+#### 修改的文件
+
+- `frontend/package.json` — 新增 `@tailwindcss/typography` 依赖
+- `frontend/app/globals.css` — 注册 `@plugin "@tailwindcss/typography"`；新增防御性 prose 回退样式
+- `frontend/app/workflows/[id]/page.tsx` — `handleEvent` 加事件白名单、`setHasReroute` 移出 updater
+- `frontend/components/dag/dag-canvas.tsx` — 新增 `useRef` data 缓存、移除 `fitView`、添加 `defaultViewport`
+- `frontend/components/dag/dag-node.tsx` — 导出 `DagNodeData` 接口
+- `frontend/components/report/report-viewer.tsx` — 移除 `text-sm`、修复 `h2` className 合并
+
+#### 可能的潜在问题
+
+- **data 缓存未检查 onRetry**：当前 `DagCanvas` 的父组件未传递 `onRetry` prop，缓存比较仅检查 status/message/duration_ms。若后续接入 onRetry 功能，缓存需增加对 onRetry 引用变化的感知（或改用 `useCallback` 稳定化）
+- **prose 回退样式优先级**：防御性回退样式以 `.prose` 前缀写在全局 CSS 中，优先级低于 typography 插件生成的 utility class。但若插件版本升级导致选择器变化，回退样式可能意外生效并与插件样式叠加，需在升级后验证
