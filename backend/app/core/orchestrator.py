@@ -6,6 +6,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.types import Command
 from app.schemas.workflow_state import WorkflowState
 from app.services.event_service import EventLogger
 from app.core.graph_nodes import (
@@ -31,12 +32,12 @@ def make_pause_router(default_next: str):
       3. 都没有 → default_next（正常流程）
     """
     def _router(state: dict) -> str:
-        # 1. 人工决策优先
+        # 1. 人工决策优先——消费时立即清除，防止后续节点 router 重复路由
         human_decision = state.get("human_decision") or {}
         if human_decision.get("action") == "jump":
             target = human_decision.get("target_node")
             if target in REROUTE_TARGETS:
-                return target
+                return Command(goto=target, update={"human_decision": None})
 
         # 2. agent 建议的 target_node 作为 fallback
         review = state.get("review_result")

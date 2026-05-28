@@ -9,6 +9,7 @@ import { useArtifacts } from "@/lib/use-artifacts";
 import { useTraceLinks } from "@/lib/use-trace";
 import { useInterviewStream } from "@/lib/use-interview-stream";
 import { useWorkflowStream } from "@/lib/use-workflow-stream";
+import { useNodeStream } from "@/lib/use-node-stream";
 import { AuthGuard } from "@/components/auth/auth-guard";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -19,7 +20,7 @@ import { ChatStream } from "@/components/interview/chat-stream";
 import { ConfigPanel } from "@/components/interview/config-panel";
 import { DagCanvas } from "@/components/dag/dag-canvas";
 import type { NodeStatus } from "@/components/dag/dag-canvas";
-import { EventConsole } from "@/components/events/event-console";
+import { StreamPanel } from "@/components/events/stream-panel";
 import { ReportViewer } from "@/components/report/report-viewer";
 import { OutlineNav } from "@/components/report/outline-nav";
 import { EvidencePanel } from "@/components/report/evidence-panel";
@@ -30,7 +31,7 @@ import { Send, ArrowLeft, Layers, FileText } from "lucide-react";
 import Link from "next/link";
 import { statusLabel, statusColor } from "@/lib/utils";
 import type { InterviewMessage } from "@/types/interview";
-import type { WorkflowConfig } from "@/types/workflow";
+import type { WorkflowConfig, WorkflowDetail } from "@/types/workflow";
 import type { WorkflowEvent, AgentNodeName } from "@/types/event";
 import type { ReportOutput, SWOTAnalysis, FeatureMatrix, ArtifactListItem } from "@/types/artifact";
 import type { TraceLink } from "@/types/trace";
@@ -56,8 +57,10 @@ export default function WorkflowStudioPage() {
       <div className="min-h-screen" style={{ backgroundColor: "var(--bg-primary)" }}>
         <Header workflow={workflow} />
         {status === "configuring" && <InterviewView workflowId={id} token={token!} />}
-        {status === "running" && <DagRuntimeView workflowId={id} token={token!} />}
-        {(status === "completed" || status === "failed") && (
+        {(status === "running" || status === "paused") && (
+          <DagRuntimeView workflowId={id} token={token!} workflow={workflow!} />
+        )}
+        {(status === "completed" || status === "failed" || status === "cancelled") && (
           <ReportView workflowId={id} workflowStatus={status!} />
         )}
       </div>
@@ -127,18 +130,18 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
         if (incoming.extracted_config) {
           setConfig((prev) => ({ ...prev, ...incoming.extracted_config }));
         }
-        if (incoming.suggested_competitors) {
+        const competitors = incoming.suggested_competitors;
+        if (competitors && competitors.length > 0) {
           setConfig((prev) => ({
             ...prev,
-            competitors: [...new Set([...(prev.competitors ?? []), ...incoming.suggested_competitors!])],
+            competitors: [...new Set([...(prev.competitors ?? []), ...competitors])],
           }));
         }
-        if (incoming.is_complete && incoming.extracted_config) {
-          setIsComplete(true);
-        }
       },
-      // onComplete: only lock when META says complete AND config was extracted
-      () => {},
+      // onComplete: stream finished with CONFIG_COMPLETE sentinel — lock config
+      () => {
+        setIsComplete(true);
+      },
       (err) => console.error("Interview SSE error:", err)
     );
   };
@@ -149,6 +152,23 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
   const handleStart = async () => {
     await startMutation.mutateAsync(workflowId);
   };
+
+  // Safety net: when interview completes, pull final config from backend
+  // in case the stream's meta block had extracted_config=null
+  useEffect(() => {
+    if (!isComplete) return;
+    const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+    fetch(`${baseUrl}/workflows/${workflowId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data?.config) {
+          setConfig((prev) => ({ ...data.config, ...prev }));
+        }
+      })
+      .catch(() => {});
+  }, [isComplete, workflowId, token]);
 
   return (
     <div className="flex h-[calc(100vh-57px)]" style={{ backgroundColor: "var(--bg-primary)" }}>
@@ -215,8 +235,8 @@ function InterviewView({ workflowId, token }: { workflowId: string; token: strin
 }
 
 /* ─── DAG Runtime View ─── */
-function DagRuntimeView({ workflowId, token }: { workflowId: string; token: string }) {
-  const [events, setEvents] = useState<WorkflowEvent[]>([]);
+function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; token: string; workflow: WorkflowDetail }) {
+  const isPaused = workflow.status === "paused";
   const [nodeStates, setNodeStates] = useState<
     Record<AgentNodeName, { status: NodeStatus; message?: string; duration_ms?: number }>
   >({
@@ -226,13 +246,31 @@ function DagRuntimeView({ workflowId, token }: { workflowId: string; token: stri
     review: { status: "idle" },
   });
   const [hasReroute, setHasReroute] = useState(false);
+  const { activeNode, texts, pushToken, setActiveNode } = useNodeStream();
+  const [dialogInput, setDialogInput] = useState("");
+  const [dialogMessages, setDialogMessages] = useState<Array<{ role: "user" | "system"; content: string; time: string }>>([]);
+  const [deciding, setDeciding] = useState(false);
+  const [decideError, setDecideError] = useState<string | null>(null);
+  const [showStaleWarning, setShowStaleWarning] = useState(false);
 
   const handleEvent = useCallback((e: WorkflowEvent) => {
-    setEvents((prev) => [...prev, e]);
+    // llm_stream events carry per-token content at top level (not in payload)
+    if (e.event_type === "llm_stream") {
+      const content = (e as unknown as { content: string }).content;
+      if (content && e.node_name) {
+        pushToken(e.node_name as AgentNodeName, content);
+      }
+      return;
+    }
+
+    // Track active node to reset stream panel when a new node starts
+    if (e.event_type === "node_start" && e.node_name) {
+      setActiveNode(e.node_name as AgentNodeName);
+    }
 
     // Only node lifecycle events affect nodeStates; skip irrelevant ones
     // to prevent ReactFlow from rebuilding all nodes on every SSE event
-    const NODE_EVENTS = ["node_start", "node_complete", "node_error", "review_reroute"];
+    const NODE_EVENTS = ["node_start", "node_complete", "node_error", "review_reroute", "reroute"];
     if (!NODE_EVENTS.includes(e.event_type)) return;
 
     setNodeStates((prev) => {
@@ -258,6 +296,7 @@ function DagRuntimeView({ workflowId, token }: { workflowId: string; token: stri
           next[node] = { ...next[node], status: "failed", message: (payload?.error_message as string) || "Error" };
           break;
         case "review_reroute":
+        case "reroute":
           next.review = { ...next.review, status: "rerouted", message: "Rerouting..." };
           if (payload?.target_node) {
             next[payload.target_node as AgentNodeName] = { ...next[payload.target_node as AgentNodeName], status: "idle" };
@@ -267,61 +306,115 @@ function DagRuntimeView({ workflowId, token }: { workflowId: string; token: stri
       return next;
     });
 
-    if (e.event_type === "review_reroute") {
+    if (e.event_type === "review_reroute" || e.event_type === "reroute") {
       setHasReroute(true);
     }
-  }, []);
+  }, [pushToken, setActiveNode]);
 
-  // Replay historical events on mount (for page revisit)
+  const handleSendDialog = () => {
+    const text = dialogInput.trim();
+    if (!text) return;
+    setDialogMessages((prev) => [...prev, {
+      role: "user",
+      content: text,
+      time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+    }]);
+    setDialogInput("");
+  };
+
+  const handleDecide = async (action: string, targetNode?: string, feedback?: string) => {
+    setDeciding(true);
+    setDecideError(null);
+    try {
+      const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+      const res = await fetch(`${baseUrl}/workflows/${workflowId}/decide`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          action,
+          target_node: targetNode || null,
+          feedback: feedback || dialogInput.trim(),
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error((err as { detail?: string }).detail || `HTTP ${res.status}`);
+      }
+      setDialogInput("");
+      setDialogMessages((prev) => [...prev, {
+        role: "system",
+        content: `已提交决策: ${action === "jump" ? `重试 ${targetNode || ""}` : action === "approve" ? "强制通过" : "放弃"}`,
+        time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+      }]);
+    } catch (err) {
+      setDecideError((err as Error).message || "决策提交失败");
+    } finally {
+      setDeciding(false);
+    }
+  };
+
+  // Replay historical events on mount to rebuild nodeStates (for page revisit)
   useEffect(() => {
     const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
-    fetch(`${baseUrl}/workflows/${workflowId}/events`, {
+    fetch(`${baseUrl}/workflows/${workflowId}/events?limit=200`, {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then((r) => r.json())
       .then((history: WorkflowEvent[]) => {
         if (!Array.isArray(history)) return;
-        // Sort by seq to replay in order
         const sorted = [...history].sort((a, b) => a.seq - b.seq);
-        setEvents(sorted);
-        // Rebuild node states from history
-        setNodeStates(() => {
-          const rebuilt: Record<AgentNodeName, { status: NodeStatus; message?: string; duration_ms?: number }> = {
-            information_collection: { status: "idle" },
-            analysis: { status: "idle" },
-            report_writing: { status: "idle" },
-            review: { status: "idle" },
-          };
-          let reroute = false;
-          for (const e of sorted) {
-            const node = e.node_name as AgentNodeName;
-            if (!node) continue;
-            const payload = e.payload as Record<string, unknown> | undefined;
-            switch (e.event_type) {
-              case "node_start":
-                rebuilt[node] = { ...rebuilt[node], status: "active", message: "Running..." };
-                break;
-              case "node_complete":
-                rebuilt[node] = { ...rebuilt[node], status: "completed", message: "Completed", duration_ms: payload?.duration_ms as number };
-                break;
-              case "node_error":
-                rebuilt[node] = { ...rebuilt[node], status: "failed", message: (payload?.error_message as string) || "Error" };
-                break;
-              case "review_reroute":
-                rebuilt.review = { ...rebuilt.review, status: "rerouted", message: "Rerouting..." };
-                if (payload?.target_node) {
-                  rebuilt[payload.target_node as AgentNodeName] = { ...rebuilt[payload.target_node as AgentNodeName], status: "idle" };
-                }
-                reroute = true;
-                break;
-            }
+        const rebuilt: Record<AgentNodeName, { status: NodeStatus; message?: string; duration_ms?: number }> = {
+          information_collection: { status: "idle" },
+          analysis: { status: "idle" },
+          report_writing: { status: "idle" },
+          review: { status: "idle" },
+        };
+        let reroute = false;
+        let lastEventTime = 0;
+        for (const e of sorted) {
+          const node = e.node_name as AgentNodeName;
+          if (!node) continue;
+          const payload = e.payload as Record<string, unknown> | undefined;
+          switch (e.event_type) {
+            case "node_start":
+              rebuilt[node] = { ...rebuilt[node], status: "active", message: "Running..." };
+              break;
+            case "node_complete":
+              rebuilt[node] = { ...rebuilt[node], status: "completed", message: "Completed", duration_ms: payload?.duration_ms as number };
+              break;
+            case "node_error":
+              rebuilt[node] = { ...rebuilt[node], status: "failed", message: (payload?.error_message as string) || "Error" };
+              break;
+            case "review_reroute":
+            case "reroute":
+              rebuilt.review = { ...rebuilt.review, status: "rerouted", message: "Rerouting..." };
+              if (payload?.target_node) {
+                rebuilt[payload.target_node as AgentNodeName] = { ...rebuilt[payload.target_node as AgentNodeName], status: "idle" };
+              }
+              reroute = true;
+              break;
           }
-          setHasReroute(reroute);
-          return rebuilt;
-        });
+          if (e.created_at) {
+            lastEventTime = Math.max(lastEventTime, new Date(e.created_at).getTime());
+          }
+        }
+        setNodeStates(rebuilt);
+        setHasReroute(reroute);
+
+        // Stale detection: running workflow with no recent events and all nodes idle
+        const allIdle = Object.values(rebuilt).every((s) => s.status === "idle");
+        if (!isPaused && allIdle && sorted.length > 0) {
+          const age = Date.now() - lastEventTime;
+          if (age > 60_000) {
+            setShowStaleWarning(true);
+          }
+        }
       })
       .catch(() => {});
-  }, [workflowId, token]);
+  }, [workflowId, token, isPaused]);
 
   useWorkflowStream({
     workflowId,
@@ -332,20 +425,103 @@ function DagRuntimeView({ workflowId, token }: { workflowId: string; token: stri
 
   return (
     <div className="flex h-[calc(100vh-57px)]" style={{ backgroundColor: "var(--bg-primary)" }}>
-      <div className="flex-1 flex flex-col p-4 gap-3">
-        <div className="flex items-center gap-2">
+      {/* Left: DAG Canvas + Dialog Input */}
+      <div className="flex-1 flex flex-col p-4 gap-3 min-w-0">
+        <div className="flex items-center gap-2 shrink-0">
           <span className="relative flex h-2 w-2">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
             <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
           </span>
           <span className="text-sm font-medium text-[var(--text-primary)]">DAG Runtime Canvas</span>
         </div>
-        <div className="flex-1">
+        <div className="flex-1 min-h-0">
           <DagCanvas nodeStates={nodeStates} hasReroute={hasReroute} />
         </div>
+        {/* Stale workflow warning */}
+        {showStaleWarning && (
+          <div className="shrink-0 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 flex items-center gap-3">
+            <span className="text-xs text-amber-300 flex-1">
+              此工作流执行可能已中断（服务重启或进程异常）。建议返回仪表板重新启动。
+            </span>
+            <Button variant="ghost" size="sm" onClick={() => setShowStaleWarning(false)} className="text-xs">
+              忽略
+            </Button>
+          </div>
+        )}
+        {/* Paused decision card */}
+        {isPaused && workflow.pause_state && (
+          <div className="shrink-0 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400" />
+              </span>
+              <span className="text-sm font-medium text-amber-300">工作流已暂停</span>
+            </div>
+            <p className="text-xs text-[var(--text-secondary)]">
+              {workflow.pause_state.pause_reason || "等待人工决策"}
+            </p>
+            {decideError && (
+              <p className="text-xs text-rose-400">{decideError}</p>
+            )}
+            <div className="flex flex-wrap gap-2">
+              {(workflow.pause_state.pause_options || []).map((opt) => (
+                <Button
+                  key={opt.value}
+                  variant={opt.value === "approve" ? "outline" : opt.value === "abort" ? "ghost" : "primary"}
+                  size="sm"
+                  disabled={deciding}
+                  onClick={() => handleDecide(opt.value, (opt as { target_node?: string }).target_node)}
+                  className="text-xs"
+                >
+                  {deciding ? "提交中..." : opt.label}
+                </Button>
+              ))}
+            </div>
+          </div>
+        )}
+        {/* Dialog input bar */}
+        <div className="shrink-0 flex gap-2">
+          <textarea
+            value={dialogInput}
+            onChange={(e) => {
+              setDialogInput(e.target.value);
+              e.target.style.height = "auto";
+              e.target.style.height = Math.min(e.target.scrollHeight, 96) + "px";
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                handleSendDialog();
+              }
+            }}
+            placeholder="输入反馈或指令，Enter 发送，Shift+Enter 换行..."
+            rows={1}
+            className="flex-1 resize-none rounded-xl border border-[var(--border)] bg-[var(--bg-card)] px-3 py-2 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 focus-visible:border-emerald-500/50 transition-all"
+          />
+          <Button onClick={handleSendDialog} variant="primary" size="icon" className="rounded-xl shrink-0">
+            <Send size={14} />
+          </Button>
+        </div>
+        {/* Dialog message history */}
+        {dialogMessages.length > 0 && (
+          <div className="shrink-0 max-h-24 overflow-y-auto space-y-1 px-1">
+            {dialogMessages.map((m, i) => (
+              <div key={i} className="text-xs flex gap-2">
+                <span className="text-[var(--text-muted)] shrink-0">{m.time}</span>
+                <span className="text-[var(--text-secondary)]">{m.content}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
-      <div className="w-[400px] border-l border-[var(--border)] p-4 flex flex-col gap-3" style={{ backgroundColor: "var(--bg-primary)" }}>
-        <EventConsole events={events} />
+
+      {/* Right: Live Stream panel */}
+      <div className="w-[400px] border-l border-[var(--border)] flex flex-col" style={{ backgroundColor: "var(--bg-primary)" }}>
+        <div className="px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-elevated)]">
+          <span className="text-xs font-medium text-[var(--text-primary)]">Live Stream</span>
+        </div>
+        <StreamPanel activeNode={activeNode} texts={texts} />
       </div>
     </div>
   );

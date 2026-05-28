@@ -5,14 +5,17 @@ export type EventType =
   | "review_pass"
   | "review_fail"
   | "review_reroute"
+  | "reroute"
   | "tool_call"
   | "tool_result"
   | "llm_request"
   | "llm_response"
+  | "llm_stream"
   | "workflow_start"
   | "workflow_complete"
   | "workflow_failed"
   | "workflow_paused"
+  | "workflow_resumed"
   | "context_compressed";
 
 export type AgentNodeName =

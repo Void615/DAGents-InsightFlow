@@ -2,6 +2,7 @@ export type WorkflowStatus =
   | "created"
   | "configuring"
   | "running"
+  | "paused"
   | "completed"
   | "failed"
   | "cancelled";
@@ -39,6 +40,13 @@ export interface WorkflowDetail {
       reviewing: PhaseStatus;
     };
     total_tokens: number;
+  };
+  pause_state?: {
+    paused_by_node: string;
+    pause_reason: string;
+    pause_options: Array<{ value: string; label: string; target_node?: string }>;
+    pause_context?: Record<string, unknown>;
+    paused_at: string;
   };
   created_at: string;
   updated_at: string;

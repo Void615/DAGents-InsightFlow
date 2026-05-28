@@ -246,3 +246,95 @@
 
 - **data 缓存未检查 onRetry**：当前 `DagCanvas` 的父组件未传递 `onRetry` prop，缓存比较仅检查 status/message/duration_ms。若后续接入 onRetry 功能，缓存需增加对 onRetry 引用变化的感知（或改用 `useCallback` 稳定化）
 - **prose 回退样式优先级**：防御性回退样式以 `.prose` 前缀写在全局 CSS 中，优先级低于 typography 插件生成的 utility class。但若插件版本升级导致选择器变化，回退样式可能意外生效并与插件样式叠加，需在升级后验证
+
+---
+
+### 10. DAG 运行时节点流式输出面板
+
+DAG 执行期间，各 agent 通过 `LLM_STREAM` 事件广播逐 token 输出，前端新增独立面板实时显示当前活跃节点的 LLM 生成内容。同时保留用户对话框，支持在执行过程中输入反馈。
+
+#### 修复方案
+
+- **流式 token 累积**：新增 `useNodeStream` hook，内部用 `useRef` 按 `node_name` 缓冲 token，以 `requestAnimationFrame` + 64ms 间隔批量刷新到 state（~15fps），避免 per-token 渲染导致 ReactFlow 画布抖动。
+- **LLM_STREAM 事件与 DAG 状态隔离**：`handleEvent` 中 `llm_stream` 事件在生命周期守卫之前处理，直接写入 token buffer 而不触发 `setNodeStates`，确保流式输出不会重新渲染 ReactFlow 节点。
+- **右侧面板改为 Tab 切换**：原 EventConsole 独占的 400px 右侧面板拆分为 "Live Stream"（实时显示当前节点 LLM 输出 + 闪烁光标）和 "Events"（结构化事件日志）两个 tab。
+- **用户对话框**：DAG 画布底部新增输入栏，支持 Enter 发送 / Shift+Enter 换行，消息显示在历史区。为后续人在回路实时打断功能预留交互基础。
+- **`node_start` 切换时自动清空上一节点的流式文本**，`StreamPanel` 显示当前活跃节点名称和实时脉冲指示器。
+
+#### 新增文件
+
+- `frontend/lib/use-node-stream.ts` — token 缓冲 + rAF 批量渲染 hook
+- `frontend/components/events/stream-panel.tsx` — 节点流式输出展示面板
+
+#### 修改的文件
+
+- `frontend/types/event.ts` — `EventType` 新增 `"llm_stream"`
+- `frontend/app/workflows/[id]/page.tsx` — `DagRuntimeView` 集成 `useNodeStream` + `StreamPanel` + 对话框；`handleEvent` 增加 `llm_stream` 和 `node_start` 流式处理分支
+
+#### 可能的潜在问题
+
+- **历史回放无流式内容**：`LLM_STREAM` 事件不写数据库（避免 token 粒度 IO），因此页面刷新后通过 `/events` 回放历史时没有流式文本，Stream 面板为空。后续可在 `node_complete` 事件的 payload 中附带完整输出文本作为回放数据源
+- **rAF 在后台 tab 暂停**：浏览器在非活跃 tab 中会暂停 `requestAnimationFrame`，导致 token 积累在 buffer 中不刷新。切回 tab 时一次性吐出大量文本。当前 `scheduleFlush` 的 fallback 路径在 rAF 未触发时通过 `elapsed >= 64ms` 判断直接 flush，但若 rAF 长时间不触发则无此路径。实际影响较小——用户看不到页面时本就不需要流畅渲染
+
+---
+
+### 11. 修复 DAG 人工跳转死循环 + 移除前端 Events 面板
+
+#### 修复方案
+
+- **collection 死循环**：`human_decision` 通过 `Command(update=...)` 注入 state 后在 resume 路径中从未被清除。Review 节点的 router 正确消费 `human_decision` 跳转到目标节点（如 collection），但目标节点执行完毕后其 router 再次看到同一 `human_decision`，又跳回同一目标节点，形成无限循环。修复方式：`make_pause_router` 中人工 jump 分支从 `return target`（纯字符串）改为 `return Command(goto=target, update={"human_decision": None})`，在消费决策的同时清除之，后续节点的 router 不再看到已消费的决策。
+- **Events 面板移除**：`DagRuntimeView` 将全部 17 种 SSE 事件无上限累积在 `events: WorkflowEvent[]` 中，每个事件到达触触发 `EventConsole` 全量 `.filter().map()` 重渲染，`llm_stream` 等高频事件加剧性能问题。修复：移除 `events` state、`rightTab` 切换逻辑、`EventConsole` 组件及其文件，右侧面板固定显示 `StreamPanel`（LLM 流式输出）。历史事件回放 `useEffect` 仅重建 `nodeStates` 不再存储事件数组。node 状态更新和流式 token 处理不受影响。
+
+#### 修改的文件
+
+- `backend/app/core/orchestrator.py` — 新增 `from langgraph.types import Command`；`make_pause_router` 人工 jump 分支返回 `Command(goto=target, update={"human_decision": None})`
+- `frontend/app/workflows/[id]/page.tsx` — 移除 `events`/`rightTab` state 及 `setEvents` 调用；右侧面板从 tab 切换改为固定 `StreamPanel`；历史回放仅重建 `nodeStates`；移除 `EventConsole` 导入
+- `frontend/components/events/event-console.tsx` — 删除
+
+#### 删除的文件
+
+- `frontend/components/events/event-console.tsx` — Events 面板组件（功能已被 StreamPanel 替代，不再需要）
+
+---
+
+### 12. 修复 Interview 配置完成检测不可靠
+
+Interview 阶段 LLM 输出 `---CONFIG_COMPLETE---` 后，前端有时无法跳转到 ready 状态，Start 按钮始终不出现。
+
+#### 修复方案
+
+- **后端 JSON 提取增强**：`try_extract_config` 先剥离 markdown 代码围栏（`` ```json ... ``` `` 或 ` ``` ... ``` `）再尝试 `find/rfind` 花括号匹配。LLM 经常用围栏包裹 JSON，原逻辑直接 `find("{")` 会在围栏内部的 JSON 前后留下 ` ``` ` 残片导致 `json.loads` 失败。
+- **前端解耦 is_complete 与 extracted_config**：`onConfig` 仅处理配置数据更新，不再兼管完成信号；`onComplete` 从空函数改为直接设置 `isComplete(true)`。原逻辑要求 `is_complete && extracted_config` 同时为真才锁定配置，当后端提取失败发送 `extracted_config: null` 时永远无法完成。
+- **安全网回拉**：`isComplete` 变为 true 时自动 fetch workflow API 拉取后端已持久化的 config，兜底覆盖极端情况。
+- **空数组守卫**：`suggested_competitors` 检查加 `.length > 0`，空数组不再触发无意义的 setConfig。
+
+#### 修改的文件
+
+- `backend/app/agents/interview_agent.py` — `try_extract_config` 增加 markdown 围栏剥离策略；抽取 `_parse_json_block` helper
+- `frontend/app/workflows/[id]/page.tsx` — `onConfig` 移除 `is_complete` 检查；`onComplete` 设置 `isComplete`；`suggested_competitors` 空数组守卫；新增安全网 `useEffect`
+
+---
+
+### 13. 工作流重进入健壮性 — 状态检测与恢复
+
+用户重新打开工作流时，前端应根据当前状态主动跳转到正确界面。修复了 4 个阻碍重进入的关键问题。
+
+#### 修复方案
+
+- **"paused" 状态前端支持**：`WorkflowStatus` 类型、`statusLabel`/`statusColor` 新增 `"paused"` 条目；路由分支 `(status === "running" || status === "paused")` → `DagRuntimeView`；暂停时显示暂停卡片（暂停原因 + 操作按钮）。
+- **对话框接线 /decide 端点**：暂停卡片中的按钮调用 `POST /{id}/decide`，传递 `action`/`target_node`/`feedback`。支持 `jump`（重试指定节点）、`approve`（强制通过）、`abort`（放弃）三种决策。决策提交后显示系统消息确认。
+- **事件类型统一**：`EventType` 新增 `"reroute"` 和 `"workflow_resumed"`；`handleEvent` 和 historical replay 同时处理 `"reroute"` 和 `"review_reroute"` 两种事件名，解决后端 resume 路径发送 `EventType.REROUTE` 而前端只识别 `"review_reroute"` 的 mismtach。
+- **事件回放增强**：历史事件请求升级为 `?limit=200`（此前依赖后端默认 50 条），避免长工作流事件被截断。
+- **僵死工作流检测**：进入 RUNNING 工作流且历史事件重放后，若所有节点状态均为 idle 且最新事件超过 60 秒，判定为僵死工作流（服务重启导致进程丢失），展示警告提示用户返回仪表板重新启动。
+
+#### 修改的文件
+
+- `frontend/types/workflow.ts` — `WorkflowStatus` 新增 `"paused"`；`WorkflowDetail` 新增 `pause_state` 字段类型
+- `frontend/types/event.ts` — `EventType` 新增 `"reroute"` 和 `"workflow_resumed"`
+- `frontend/lib/utils.ts` — `statusLabel` 新增 `paused: "已暂停"`；`statusColor` 新增 amber 主题暂停色
+- `frontend/app/workflows/[id]/page.tsx` — 路由支持 `paused`/`cancelled`；`DagRuntimeView` 接收 `workflow` prop；暂停卡片 UI + `/decide` 接线；事件类型 `reroute` 处理；事件回放 `limit=200`；僵死检测 + 警告提示
+
+#### 可能的潜在问题
+
+- **僵死检测仅前端**：服务重启后僵死工作流仅前端展示警告，无后端自动恢复机制。后续可在后端增加启动时扫描 `running` 工作流并按 checkpoint 自动 resume 的逻辑。
+- **/decide 成功后的 UI 刷新**：决策提交后通过 SSE `workflow_resumed` / `node_start` 事件驱动 UI 更新，而非主动刷新 workflow 查询。若 SSE 连接延迟，暂停卡片可能短暂保持显示。后续可加 `router.refresh()` 强制刷新。

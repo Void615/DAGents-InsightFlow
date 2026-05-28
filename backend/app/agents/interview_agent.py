@@ -1,4 +1,5 @@
 import json
+import re
 from typing import AsyncGenerator, List
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, BaseMessage
@@ -91,15 +92,22 @@ class InterviewAgent:
     def try_extract_config(self, full_text: str) -> WorkflowConfig | None:
         """从 LLM 累积回复中提取 WorkflowConfig。
 
-        采用宽松匹配（取第一个 { 到最后一个 }），而非要求 JSON 是唯一内容，
-        因为 LLM 可能在对话文本中嵌入 JSON 而非单独输出。
+        先尝试剥离 markdown 代码围栏（```json ... ``` 或 ``` ... ```），
+        再 fallback 到首尾花括号匹配，兼容 LLM 在对话文本中嵌入 JSON 的输出风格。
         """
+        fence_matches = re.findall(r'```(?:json)?\s*\n?(.*?)\n?```', full_text, re.DOTALL)
+        for match in fence_matches:
+            config = self._parse_json_block(match)
+            if config:
+                return config
+        return self._parse_json_block(full_text)
+
+    def _parse_json_block(self, text: str) -> WorkflowConfig | None:
         try:
-            start = full_text.find("{")
-            end = full_text.rfind("}")
-            if start != -1 and end != -1:
-                json_str = full_text[start:end+1]
-                data = json.loads(json_str)
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                data = json.loads(text[start:end+1])
                 return WorkflowConfig(**data)
         except Exception:
             return None
