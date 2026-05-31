@@ -7,7 +7,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { motion, AnimatePresence } from "framer-motion";
 import { Check, Plus, X, ChevronDown, Pencil } from "lucide-react";
 import { useState } from "react";
-import type { WorkflowConfig } from "@/types/workflow";
+import type { ProductProfile, WorkflowConfig } from "@/types/workflow";
 
 interface Props {
   config: Partial<WorkflowConfig>;
@@ -43,6 +43,13 @@ export function ConfigPanel({
 }: Props) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const toggle = (k: string) => setCollapsed((p) => ({ ...p, [k]: !p[k] }));
+  const productProfile = config.product_profile ?? emptyProductProfile(config);
+  const updateProfile = (field: keyof ProductProfile, value: string | string[]) => {
+    onConfigChange("product_profile", {
+      ...productProfile,
+      [field]: value,
+    });
+  };
 
   return (
     <div className="flex flex-col h-full space-y-4">
@@ -101,6 +108,73 @@ export function ConfigPanel({
                 {cat}
               </button>
             ))}
+          </div>
+        </FieldSection>
+
+        <FieldSection label="产品画像" collapsed={collapsed.profile} onToggle={() => toggle("profile")}>
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              <ProfileInput
+                label="规范名称"
+                value={productProfile.canonical_name}
+                placeholder={config.target_product || "等待识别..."}
+                onChange={(value) => updateProfile("canonical_name", value)}
+              />
+              <ProfileInput
+                label="产品形态"
+                value={productProfile.product_form}
+                placeholder="hardware / software"
+                onChange={(value) => updateProfile("product_form", value)}
+              />
+              <ProfileInput
+                label="细分市场"
+                value={productProfile.market_category}
+                placeholder="smartphone"
+                onChange={(value) => updateProfile("market_category", value)}
+              />
+              <ProfileInput
+                label="市场定位"
+                value={productProfile.market_segment}
+                placeholder="flagship smartphone"
+                onChange={(value) => updateProfile("market_segment", value)}
+              />
+              <ProfileInput
+                label="品牌"
+                value={productProfile.brand}
+                placeholder="Samsung"
+                onChange={(value) => updateProfile("brand", value)}
+              />
+              <ProfileInput
+                label="产品线"
+                value={productProfile.product_line}
+                placeholder="Galaxy S"
+                onChange={(value) => updateProfile("product_line", value)}
+              />
+              <ProfileInput
+                label="SKU层级"
+                value={productProfile.variant_tier}
+                placeholder="standard / pro / ultra"
+                onChange={(value) => updateProfile("variant_tier", value)}
+              />
+            </div>
+            <ProfileInput
+              label="型号"
+              value={productProfile.model}
+              placeholder="S26"
+              onChange={(value) => updateProfile("model", value)}
+            />
+            <ListProfileInput
+              label="竞品边界"
+              value={productProfile.competition_basis}
+              placeholder="same category, similar price band"
+              onChange={(value) => updateProfile("competition_basis", value)}
+            />
+            <ListProfileInput
+              label="排除关系"
+              value={productProfile.exclude_relations}
+              placeholder="same brand same series variant, accessory"
+              onChange={(value) => updateProfile("exclude_relations", value)}
+            />
           </div>
         </FieldSection>
 
@@ -183,6 +257,76 @@ export function ConfigPanel({
       </AnimatePresence>
     </div>
   );
+}
+
+function emptyProductProfile(config: Partial<WorkflowConfig>): ProductProfile {
+  return {
+    canonical_name: config.target_product ?? "",
+    product_form: "",
+    market_category: "",
+    brand: "",
+    product_line: "",
+    model: "",
+    variant_tier: "",
+    market_segment: "",
+    competition_basis: [],
+    exclude_relations: [],
+  };
+}
+
+function ProfileInput({
+  label,
+  value,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  value?: string;
+  placeholder?: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="space-y-1">
+      <span className="block text-[10px] text-[var(--text-muted)]">{label}</span>
+      <Input
+        value={value ?? ""}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="h-8 text-xs bg-[var(--bg-elevated)] border-[var(--border)]"
+      />
+    </label>
+  );
+}
+
+function ListProfileInput({
+  label,
+  value,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  value?: string[];
+  placeholder?: string;
+  onChange: (value: string[]) => void;
+}) {
+  return (
+    <label className="space-y-1">
+      <span className="block text-[10px] text-[var(--text-muted)]">{label}</span>
+      <Input
+        value={(value ?? []).join(", ")}
+        onChange={(e) => onChange(splitProfileList(e.target.value))}
+        placeholder={placeholder}
+        className="h-8 text-xs bg-[var(--bg-elevated)] border-[var(--border)]"
+      />
+    </label>
+  );
+}
+
+function splitProfileList(value: string): string[] {
+  return value
+    .split(/[,，、]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function FieldSection({

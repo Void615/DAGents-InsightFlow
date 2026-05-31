@@ -51,6 +51,7 @@ class ReportAgent(BaseAgent):
             config = {}
         target = config.get("target_product", "未知产品")
         raw_data = state.get("raw_data", {}) or {}
+        collection_errors = state.get("collection_errors", {}) or {}
 
         await self.log_and_broadcast(event_logger, EventType.NODE_START, {
             "input_summary": {"phase": "writing", "target_product": target},
@@ -60,7 +61,13 @@ class ReportAgent(BaseAgent):
 
         # 引用在 LLM 调用前构建，因为 LLM 不负责 URL 去重和编号
         citations = self._build_citations(raw_data)
-        if llm_is_configured():
+        hard_collection_error = (
+            collection_errors.get("__competitor_resolution__")
+            or collection_errors.get("__source_coverage__")
+        )
+        if hard_collection_error:
+            report = self._insufficient_report(target, hard_collection_error, citations)
+        elif llm_is_configured():
             draft = await self.invoke_llm(
                 REPORT_SYSTEM_PROMPT,
                 {
@@ -105,6 +112,45 @@ class ReportAgent(BaseAgent):
             "report": report.model_dump(mode="json"),
             "current_phase": "writing",
         }
+
+    def _insufficient_report(self, target: str, reason: str, citations: list[Citation]) -> ReportOutput:
+        title = f"{target} 竞品分析报告（资料不足，未完成）"
+        executive_summary = (
+            "本次工作流未解析出足够明确的竞品实体，无法生成可交付的竞品分析结论。"
+            f"原因：{reason}"
+        )
+        sections = [
+            ReportSection(
+                heading="未完成原因",
+                level=2,
+                content="竞品必须是明确的产品、品牌或服务实体；品类描述、用户自然语言片段、文章标题或媒体来源不能作为竞品。",
+                source_refs=[],
+            ),
+            ReportSection(
+                heading="建议",
+                level=2,
+                content="请补充明确竞品名称，或重新运行竞品推荐后再生成报告。",
+                source_refs=[],
+            ),
+        ]
+        markdown = "\n\n".join([
+            f"# {title}",
+            "## 执行摘要",
+            executive_summary,
+            "## 未完成原因",
+            sections[0].content,
+            "## 建议",
+            sections[1].content,
+        ])
+        markdown = self._append_citations(markdown, citations)
+        return ReportOutput(
+            title=title,
+            executive_summary=executive_summary,
+            sections=sections,
+            citations=citations,
+            full_markdown=markdown,
+            generated_at=datetime.utcnow(),
+        )
 
     def _build_citations(self, raw_data: dict) -> list[Citation]:
         """从原始搜索结果为每个唯一 URL 生成编号引用。

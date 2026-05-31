@@ -303,6 +303,39 @@ class TestReviewAgentRuleBased:
         assert review.passed is False
         assert review.target_node == "information_collection"
 
+    def test_rule_based_review_failed_due_to_missing_competitor_source(self):
+        agent = ReviewAgent()
+        state = {
+            "config": {
+                "target_product": "淘宝",
+                "product_category": "移动应用",
+                "competitors": ["京东", "拼多多"],
+                "competitor_count": 2,
+            },
+            "report": {
+                "title": "Test Report",
+                "executive_summary": "summary here",
+                "full_markdown": "x" * 600,
+                "sections": [{"title": "s1"}, {"title": "s2"}, {"title": "s3"}, {"title": "s4"}],
+                "citations": [{"url": "http://example.com", "title": "ref"}],
+            },
+            "raw_data": {
+                "淘宝": [{"url": "http://taobao.example"}],
+                "京东": [{"url": "http://jd.example"}],
+                "拼多多": [],
+            },
+            "collection_errors": {"__source_coverage__": "Missing source coverage for: 拼多多"},
+            "feature_matrix": {"matrix": [{"feature": "f1"}]},
+            "pricing_comparison": {"plans": [{"name": "basic"}]},
+            "user_sentiment": {"per_product": {"淘宝": "positive"}},
+            "swot": {"strengths": ["strong brand"]},
+        }
+        review = agent._rule_based_review(state)
+        assert review.passed is False
+        assert review.target_node == "information_collection"
+        assert "Missing source coverage for: 拼多多" in review.feedback
+        assert "以下产品缺少来源：拼多多" in review.feedback
+
     def test_rule_based_review_failed_due_to_analysis_gaps(self):
         agent = ReviewAgent()
         state = {

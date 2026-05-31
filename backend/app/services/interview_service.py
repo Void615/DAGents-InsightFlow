@@ -8,6 +8,9 @@ from app.config import get_settings
 from app.db.models.workflow import InterviewMessageModel
 from app.db.queries.workflow_queries import get_workflow_by_uuid, get_message_history
 from app.agents.interview_agent import InterviewAgent
+from app.agents.competitor_resolver import resolve_competitors
+from app.agents.product_profiler import build_product_profile
+from app.schemas.workflow import ProductProfile
 
 settings = get_settings()
 
@@ -51,8 +54,30 @@ async def save_message(db: AsyncSession, workflow_id: uuid.UUID, role: str, cont
     await db.commit()
 
 
-async def suggest_competitors(target_product: str, category: str) -> List[str]:
-    """通过 Tavily 搜索推荐竞品列表。网络异常时静默返回空列表。"""
+async def suggest_competitors(
+    target_product: str,
+    category: str,
+    focus_dimensions: list[str] | None = None,
+    existing_competitors: list[str] | None = None,
+    competitor_count: int = 5,
+    product_profile: ProductProfile | dict | None = None,
+) -> List[str]:
+    """通过 Tavily 搜索推荐并校验竞品列表。网络异常时静默返回空列表。"""
+    resolution = await resolve_competitors(
+        client=_get_tavily_client(),
+        target_product=target_product,
+        category=category,
+        focus_dimensions=focus_dimensions or [],
+        competitor_names=existing_competitors or [],
+        competitor_count=competitor_count,
+        product_profile=product_profile,
+    )
+    if resolution.competitors:
+        return resolution.competitors
+    if existing_competitors:
+        return existing_competitors
+
+    # Fallback for categories not covered by deterministic extractors.
     try:
         query = f"与{target_product}同类的主流竞品产品有哪些，只返回产品名称列表，不返回其他内容"
         result = await _get_tavily_client().search(query, max_results=3)
@@ -97,8 +122,21 @@ async def stream_interview_response(
     if config:
         workflow = await get_workflow_by_uuid(db, workflow_id)
         if workflow:
-            if not config.competitors:
-                config.competitors = await suggest_competitors(config.target_product, config.product_category)
+            config.product_profile = await build_product_profile(
+                target_product=config.target_product,
+                category=config.product_category,
+                focus_dimensions=config.focus_dimensions,
+                existing_profile=config.product_profile,
+                client=_get_tavily_client(),
+            )
+            config.competitors = await suggest_competitors(
+                config.target_product,
+                config.product_category,
+                config.focus_dimensions,
+                config.competitors,
+                config.competitor_count,
+                config.product_profile,
+            )
             workflow.config = config.model_dump()
             await db.commit()
 

@@ -7,5 +7,5 @@ interface SpinnerProps {
 }
 
 export function Spinner({ className, size = 16 }: SpinnerProps) {
-  return <Loader2 className={cn("animate-spin text-emerald-400", className)} size={size} />;
+  return <Loader2 suppressHydrationWarning className={cn("animate-spin text-emerald-400", className)} size={size} />;
 }

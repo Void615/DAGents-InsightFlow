@@ -7,6 +7,7 @@ import uuid
 import time
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from langgraph.types import interrupt
 from app.agents.collection_agent import CollectionAgent
 from app.agents.analysis_agent import AnalysisAgent
@@ -14,6 +15,7 @@ from app.agents.report_agent import ReportAgent
 from app.agents.review_agent import ReviewAgent
 from app.core.node_executor import execute_with_retry, NodeFatalError
 from app.services.event_service import EventLogger
+from app.db.queries.workflow_queries import get_workflow_by_uuid
 from app.db.models.workflow_node_state import WorkflowNodeState
 from app.db.models.artifact import Artifact
 from app.exceptions import AppException
@@ -161,6 +163,12 @@ async def _execute_node(
 def make_collection_node(db: AsyncSession, workflow_id: uuid.UUID, event_logger: EventLogger, execution_attempt: int):
     async def collection_node(state: dict) -> dict:
         result = await _execute_node(db, workflow_id, execution_attempt, "information_collection", state, event_logger, _collection_agent.run)
+        if isinstance(result.get("config"), dict):
+            workflow = await get_workflow_by_uuid(db, workflow_id)
+            if workflow:
+                workflow.config = result["config"]
+                flag_modified(workflow, "config")
+                await db.commit()
         if result.get("raw_data"):
             await _save_artifact(db, workflow_id, execution_attempt, "collection_raw",
                                  "采集原始数据", result["raw_data"], "information_collection")

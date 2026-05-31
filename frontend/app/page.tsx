@@ -16,7 +16,7 @@ export default function HomePage() {
   }, [isLoading, isAuthenticated, router]);
 
   return (
-    <div className="flex h-screen items-center justify-center" style={{ backgroundColor: "var(--bg-primary)" }}>
+    <div suppressHydrationWarning className="flex h-screen items-center justify-center bg-[var(--bg-primary)]">
       <Spinner size={24} />
     </div>
   );
