@@ -26,6 +26,48 @@ def _extract_error_info(e: Exception) -> tuple[str, str, dict | None]:
     return "EXECUTION_ERROR", str(e)[:1000], None
 
 
+def _extract_interrupt_payload(final_state: dict | None) -> dict | None:
+    if not isinstance(final_state, dict) or "__interrupt__" not in final_state:
+        return None
+    interrupt_value = final_state.get("__interrupt__")
+    if isinstance(interrupt_value, (list, tuple)) and interrupt_value:
+        interrupt_value = interrupt_value[0]
+    if hasattr(interrupt_value, "value"):
+        interrupt_value = interrupt_value.value
+    elif isinstance(interrupt_value, dict) and "value" in interrupt_value:
+        interrupt_value = interrupt_value["value"]
+    return interrupt_value if isinstance(interrupt_value, dict) else {}
+
+
+def _review_failed(final_state: dict | None) -> bool:
+    if not isinstance(final_state, dict):
+        return True
+    review = final_state.get("review_result")
+    if not isinstance(review, dict):
+        return False
+    return review.get("passed") is False
+
+
+def _review_failure_message(final_state: dict | None) -> str:
+    if not isinstance(final_state, dict):
+        return "工作流未返回有效最终状态"
+    review = final_state.get("review_result")
+    if isinstance(review, dict):
+        return str(review.get("feedback") or "报告质检未通过")[:1000]
+    return "报告质检未通过"
+
+
+def _make_pause_state(pause_data: dict) -> dict:
+    return {
+        "paused_by_node": pause_data.get("paused_by_node", ""),
+        "pause_reason": pause_data.get("pause_reason", ""),
+        "pause_options": pause_data.get("pause_options", []),
+        "pause_context": pause_data.get("pause_context", {}),
+        "dag_state": pause_data.get("dag_state", {}),
+        "paused_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 async def run_workflow(workflow_id: uuid.UUID) -> None:
     """BackgroundTasks 入口，运行完整 DAG。使用独立 DB session。
 
@@ -87,6 +129,51 @@ async def run_workflow(workflow_id: uuid.UUID) -> None:
 
             final_state = await compiled_graph.ainvoke(initial_state, config)
 
+            pause_data = _extract_interrupt_payload(final_state)
+            if pause_data is not None:
+                workflow.status = "paused"
+                workflow.pause_state = _make_pause_state(pause_data)
+                workflow.current_phase = "reviewing"
+                await db.commit()
+
+                await event_logger.log(
+                    event_type=EventType.WORKFLOW_PAUSED,
+                    payload=workflow.pause_state,
+                    node_name=pause_data.get("paused_by_node", "review"),
+                )
+                await sse_manager.broadcast(workflow_id, {
+                    "event_type": EventType.WORKFLOW_PAUSED.value,
+                    **workflow.pause_state,
+                })
+                return
+
+            if _review_failed(final_state):
+                workflow.status = "failed"
+                workflow.current_phase = "reviewing"
+                workflow.revision_count = (
+                    final_state.get("revision_count", 0)
+                    if isinstance(final_state, dict)
+                    else 0
+                )
+                workflow.error_message = _review_failure_message(final_state)
+                await db.commit()
+
+                await event_logger.log(
+                    event_type=EventType.WORKFLOW_FAILED,
+                    payload={
+                        "error_code": "REVIEW_FAILED",
+                        "error_message": workflow.error_message,
+                        "error_details": final_state.get("review_result") if isinstance(final_state, dict) else None,
+                    },
+                    node_name="__workflow__",
+                )
+                await sse_manager.broadcast(workflow_id, {
+                    "event_type": EventType.WORKFLOW_FAILED.value,
+                    "error_code": "REVIEW_FAILED",
+                    "error_message": workflow.error_message[:200],
+                })
+                return
+
             workflow.status = "completed"
             workflow.current_phase = "done"
             workflow.revision_count = final_state.get("revision_count", 0)
@@ -107,16 +194,7 @@ async def run_workflow(workflow_id: uuid.UUID) -> None:
             pause_data = e.args[0] if e.args else {}
 
             workflow.status = "paused"
-            workflow.pause_state = {
-                "paused_by_node": pause_data.get("paused_by_node", ""),
-                "pause_reason": pause_data.get("pause_reason", ""),
-                "pause_options": pause_data.get("pause_options", []),
-                "pause_context": pause_data.get("pause_context", {}),
-                # 保留 dag_state（graph_nodes 已 _sanitize_for_json 剥离 messages 等大字段）
-                # resume 时读取其中的 review_result 作为 cached_review_result，避免 LLM 重跑
-                "dag_state": pause_data.get("dag_state", {}),
-                "paused_at": datetime.now(timezone.utc).isoformat(),
-            }
+            workflow.pause_state = _make_pause_state(pause_data)
             await db.commit()
 
             await event_logger.log(
@@ -247,6 +325,51 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
                 config,
             )
 
+            pause_data = _extract_interrupt_payload(final_state)
+            if pause_data is not None:
+                workflow.status = "paused"
+                workflow.pause_state = _make_pause_state(pause_data)
+                workflow.current_phase = "reviewing"
+                await db.commit()
+
+                await event_logger.log(
+                    event_type=EventType.WORKFLOW_PAUSED,
+                    payload=workflow.pause_state,
+                    node_name=pause_data.get("paused_by_node", "review"),
+                )
+                await sse_manager.broadcast(workflow_id, {
+                    "event_type": EventType.WORKFLOW_PAUSED.value,
+                    **workflow.pause_state,
+                })
+                return
+
+            if _review_failed(final_state):
+                workflow.status = "failed"
+                workflow.current_phase = "reviewing"
+                workflow.revision_count = (
+                    final_state.get("revision_count", 0)
+                    if isinstance(final_state, dict)
+                    else workflow.revision_count
+                )
+                workflow.error_message = _review_failure_message(final_state)
+                await db.commit()
+
+                await event_logger.log(
+                    event_type=EventType.WORKFLOW_FAILED,
+                    payload={
+                        "error_code": "REVIEW_FAILED",
+                        "error_message": workflow.error_message,
+                        "error_details": final_state.get("review_result") if isinstance(final_state, dict) else None,
+                    },
+                    node_name="__workflow__",
+                )
+                await sse_manager.broadcast(workflow_id, {
+                    "event_type": EventType.WORKFLOW_FAILED.value,
+                    "error_code": "REVIEW_FAILED",
+                    "error_message": workflow.error_message[:200],
+                })
+                return
+
             workflow.status = "completed"
             workflow.current_phase = "done"
             workflow.revision_count = final_state.get("revision_count", 0)
@@ -266,15 +389,7 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest) -> 
             pause_data = e.args[0] if e.args else {}
 
             workflow.status = "paused"
-            workflow.pause_state = {
-                "paused_by_node": pause_data.get("paused_by_node", ""),
-                "pause_reason": pause_data.get("pause_reason", ""),
-                "pause_options": pause_data.get("pause_options", []),
-                "pause_context": pause_data.get("pause_context", {}),
-                # 同 run_workflow：保留 dag_state 供下一次 resume 复用 cached_review_result
-                "dag_state": pause_data.get("dag_state", {}),
-                "paused_at": datetime.now(timezone.utc).isoformat(),
-            }
+            workflow.pause_state = _make_pause_state(pause_data)
             await db.commit()
 
             await event_logger.log(

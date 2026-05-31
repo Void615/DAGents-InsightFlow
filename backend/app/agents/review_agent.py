@@ -2,6 +2,7 @@ import time
 import uuid
 from app.agents.base_agent import BaseAgent
 from app.agents.agent_utils import llm_is_configured
+from app.agents.competitor_resolver import is_valid_competitor_name
 from app.services.event_service import EventLogger
 from app.schemas.event import EventType
 from app.schemas.review import ReviewOutput, ReviewCheck
@@ -14,6 +15,8 @@ REVIEW_SYSTEM_PROMPT = """你是竞品分析报告质检员。请审查输入报
 - passed 只有在 score >= 70 且没有关键问题时才为 true。
 - 如果不通过，target_node 必须是 information_collection、analysis、report_writing 三者之一。
 - 如果来源明显不足，target_node=information_collection；如果分析结构缺失，target_node=analysis；如果只有报告表达/组织问题，target_node=report_writing。
+- competitors 必须是明确产品/品牌/服务实体，不能是品类词、用户自然语言片段、媒体站、文章标题或泛化描述。
+- 每个有效竞品都应有对应来源覆盖；有效竞品不足时必须不通过并回退 information_collection。
 JSON schema:
 {
   "passed": true,
@@ -56,10 +59,12 @@ class ReviewAgent(BaseAgent):
                     "user_sentiment": state.get("user_sentiment"),
                     "swot": state.get("swot"),
                     "report": state.get("report"),
+                    "competitor_quality": self._competitor_quality_summary(state),
                 },
                 ReviewOutput,
                 event_logger, workflow_id, "report_review",
             )
+            review = self._apply_hard_gates(review, state)
             await self.log_and_broadcast(event_logger, EventType.LLM_RESPONSE, {
                 "model_task": "report_review",
                 "score": review.score,
@@ -133,6 +138,9 @@ class ReviewAgent(BaseAgent):
         回退优先级：来源不足 → 重采集；分析缺失 → 重分析；其余 → 重报告。
         """
         report = state.get("report") or {}
+        config = state.get("config") or {}
+        if not isinstance(config, dict):
+            config = {}
         raw_data = state.get("raw_data") or {}
         feature_matrix = state.get("feature_matrix") or {}
         pricing = state.get("pricing_comparison") or {}
@@ -142,6 +150,7 @@ class ReviewAgent(BaseAgent):
         markdown = report.get("full_markdown", "") if isinstance(report, dict) else ""
         citations = report.get("citations", []) if isinstance(report, dict) else []
         source_count = sum(len(items) for items in raw_data.values()) if isinstance(raw_data, dict) else 0
+        competitor_quality = self._competitor_quality_summary(state)
 
         checks = [
             ReviewCheck(
@@ -164,16 +173,33 @@ class ReviewAgent(BaseAgent):
                 passed=bool(report.get("title")) and bool(report.get("executive_summary")),
                 detail="标题和摘要存在" if report.get("title") and report.get("executive_summary") else "缺少标题或摘要",
             ),
+            ReviewCheck(
+                dimension="competitor_validity",
+                passed=competitor_quality["valid"],
+                detail=competitor_quality["validity_detail"],
+            ),
+            ReviewCheck(
+                dimension="source_coverage",
+                passed=competitor_quality["source_coverage_ok"],
+                detail=competitor_quality["coverage_detail"],
+            ),
         ]
 
         passed_count = sum(1 for check in checks if check.passed)
         score = round(passed_count / len(checks) * 100, 1)
-        # evidence 是硬性要求：无来源的报告即使其他项全过也不通过
+        # evidence/competitor validity/source coverage 是硬性要求。
         evidence_ok = checks[1].passed
-        passed = score >= 70 and evidence_ok
+        competitor_ok = competitor_quality["valid"] and competitor_quality["source_coverage_ok"]
+        passed = score >= 70 and evidence_ok and competitor_ok
         target_node = None
         if not passed:
-            if source_count == 0:
+            collection_errors = state.get("collection_errors") or {}
+            if (
+                source_count == 0
+                or not competitor_ok
+                or "__competitor_resolution__" in collection_errors
+                or "__source_coverage__" in collection_errors
+            ):
                 target_node = "information_collection"
             elif not checks[2].passed:
                 target_node = "analysis"
@@ -189,3 +215,123 @@ class ReviewAgent(BaseAgent):
             target_node=target_node,
             specific_issues=issues,
         )
+
+    def _apply_hard_gates(self, review: ReviewOutput, state: dict) -> ReviewOutput:
+        competitor_quality = self._competitor_quality_summary(state)
+        if competitor_quality["valid"] and competitor_quality["source_coverage_ok"]:
+            return review
+
+        checks = list(review.checks)
+        existing_dimensions = {check.dimension for check in checks}
+        if "competitor_validity" not in existing_dimensions:
+            checks.append(ReviewCheck(
+                dimension="competitor_validity",
+                passed=competitor_quality["valid"],
+                detail=competitor_quality["validity_detail"],
+            ))
+        if "source_coverage" not in existing_dimensions:
+            checks.append(ReviewCheck(
+                dimension="source_coverage",
+                passed=competitor_quality["source_coverage_ok"],
+                detail=competitor_quality["coverage_detail"],
+            ))
+
+        issues = list(review.specific_issues)
+        for detail in (competitor_quality["validity_detail"], competitor_quality["coverage_detail"]):
+            if detail and detail not in issues:
+                issues.append(detail)
+
+        hard_gate_feedback = "竞品实体或来源覆盖未通过硬性校验"
+        feedback = review.feedback
+        if hard_gate_feedback not in feedback:
+            feedback = f"{feedback}；{hard_gate_feedback}" if feedback else hard_gate_feedback
+
+        return ReviewOutput(
+            passed=False,
+            score=min(review.score, 60),
+            checks=checks,
+            feedback=feedback,
+            target_node="information_collection",
+            specific_issues=issues,
+        )
+
+    def _competitor_quality_summary(self, state: dict) -> dict:
+        config = state.get("config") or {}
+        raw_data = state.get("raw_data") or {}
+        collection_errors = state.get("collection_errors") or {}
+        if not isinstance(config, dict):
+            config = {}
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+
+        target = config.get("target_product", "")
+        category = config.get("product_category", "")
+        product_profile = config.get("product_profile")
+        competitors = config.get("competitors", []) or []
+        requested_count = int(config.get("competitor_count") or len(competitors) or 0)
+
+        if not target and not competitors:
+            return {
+                "valid": True,
+                "source_coverage_ok": True,
+                "validity_detail": "未提供工作流配置，跳过竞品有效性检查",
+                "coverage_detail": "未提供工作流配置，跳过竞品来源覆盖检查",
+                "invalid_competitors": [],
+                "missing_source_products": [],
+            }
+        if target and "competitors" not in config and "competitor_count" not in config:
+            return {
+                "valid": True,
+                "source_coverage_ok": True,
+                "validity_detail": "配置未包含竞品字段，跳过竞品有效性检查",
+                "coverage_detail": "配置未包含竞品字段，跳过竞品来源覆盖检查",
+                "invalid_competitors": [],
+                "missing_source_products": [],
+            }
+
+        invalid = []
+        for competitor in competitors:
+            ok, reason = is_valid_competitor_name(competitor, target, category, product_profile)
+            if not ok:
+                invalid.append({"name": competitor, "reason": reason})
+
+        minimum_competitors = 1 if requested_count <= 1 else min(2, requested_count)
+        valid_count = len(competitors) - len(invalid)
+        hard_collection_error = (
+            collection_errors.get("__competitor_resolution__")
+            or collection_errors.get("__source_coverage__")
+        )
+        has_collection_hard_error = bool(hard_collection_error)
+        valid = valid_count >= minimum_competitors and not invalid and not has_collection_hard_error
+
+        products_to_check = [product for product in [target, *competitors] if product]
+        missing_sources = [
+            product for product in products_to_check
+            if not isinstance(raw_data.get(product), list) or len(raw_data.get(product, [])) == 0
+        ]
+        source_coverage_ok = not missing_sources and not has_collection_hard_error
+
+        if invalid:
+            validity_detail = "存在无效竞品：" + "，".join(f"{item['name']}({item['reason']})" for item in invalid)
+        elif has_collection_hard_error:
+            validity_detail = hard_collection_error
+        elif valid_count < minimum_competitors:
+            validity_detail = f"有效竞品数量不足：{valid_count}/{minimum_competitors}"
+        else:
+            validity_detail = "竞品均为明确产品实体"
+
+        if missing_sources:
+            coverage_detail = "以下产品缺少来源：" + "，".join(missing_sources)
+        elif has_collection_hard_error:
+            coverage_detail = hard_collection_error
+        else:
+            coverage_detail = "目标产品与竞品均有来源覆盖"
+
+        return {
+            "valid": valid,
+            "source_coverage_ok": source_coverage_ok,
+            "validity_detail": validity_detail,
+            "coverage_detail": coverage_detail,
+            "invalid_competitors": invalid,
+            "missing_source_products": missing_sources,
+        }

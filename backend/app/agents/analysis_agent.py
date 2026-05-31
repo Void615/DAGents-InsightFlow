@@ -30,7 +30,8 @@ ANALYSIS_SYSTEM_PROMPT = """你是资深竞品分析师。请只基于用户提�
 要求：
 - 只输出一个合法 JSON 对象，不要 Markdown，不要解释。
 - 不要编造具体价格、功能或评价；来源不足时写"公开来源不足"或"未在来源中确认"。
-- feature_matrix.dimensions 应覆盖用户关注维度，matrix 中每项 products 要包含目标产品和所有竞品。
+- feature_matrix.dimensions 应覆盖用户关注维度，matrix 中每项 products 只能包含 allowed_products 中列出的产品。
+- 不要新增 allowed_products 之外的产品或竞品列。
 - pricing_comparison.plans[].tiers[].price 必须是数字；无法确认具体价格时填 0，并在 highlights 说明未确认。
 - user_sentiment.per_product 的 positive/negative/neutral 用整数估计来源倾向，来源不足时 neutral 至少为 1。
 - swot.source_refs 使用要点到 URL 列表的映射。
@@ -57,9 +58,16 @@ class AnalysisAgent(BaseAgent):
             config = {}
         target = config.get("target_product", "")
         competitors = config.get("competitors", []) or []
-        products = [p for p in [target, *competitors] if p]
         focus_dimensions = config.get("focus_dimensions", ["功能", "定价", "用户评价", "市场定位"])
         raw_data = state.get("raw_data", {}) or {}
+        if isinstance(raw_data, dict):
+            collected_products = [product for product, items in raw_data.items() if product and isinstance(items, list)]
+            competitors = [product for product in competitors if product in raw_data]
+            if target and target not in raw_data:
+                collected_products = [target, *collected_products]
+            products = [p for p in [target, *competitors] if p and p in collected_products]
+        else:
+            products = [p for p in [target, *competitors] if p]
 
         await self.log_and_broadcast(event_logger, EventType.NODE_START, {
             "input_summary": {
@@ -78,6 +86,7 @@ class AnalysisAgent(BaseAgent):
                 {
                     "target_product": target,
                     "competitors": competitors,
+                    "allowed_products": products,
                     "focus_dimensions": focus_dimensions,
                     "extra_requirements": config.get("extra_requirements", ""),
                     "sources_by_product": raw_data_to_context(raw_data),
@@ -95,6 +104,12 @@ class AnalysisAgent(BaseAgent):
             pricing_comparison = bundle.pricing_comparison
             user_sentiment = bundle.user_sentiment
             swot = bundle.swot
+            feature_matrix, pricing_comparison, user_sentiment = self._restrict_to_products(
+                feature_matrix,
+                pricing_comparison,
+                user_sentiment,
+                products,
+            )
         else:
             feature_matrix, pricing_comparison, user_sentiment, swot = self._fallback_analysis(
                 target, competitors, focus_dimensions, raw_data
@@ -118,6 +133,40 @@ class AnalysisAgent(BaseAgent):
             "swot": swot.model_dump(mode="json"),
             "current_phase": "analyzing",
         }
+
+    def _restrict_to_products(
+        self,
+        feature_matrix: FeatureMatrix,
+        pricing_comparison: PricingComparison,
+        user_sentiment: UserSentimentAnalysis,
+        allowed_products: list[str],
+    ) -> tuple[FeatureMatrix, PricingComparison, UserSentimentAnalysis]:
+        allowed = set(allowed_products)
+
+        feature_data = feature_matrix.model_dump(mode="json")
+        for item in feature_data.get("matrix", []):
+            products = item.get("products", {})
+            if isinstance(products, dict):
+                item["products"] = {name: value for name, value in products.items() if name in allowed}
+
+        pricing_data = pricing_comparison.model_dump(mode="json")
+        pricing_data["plans"] = [
+            plan for plan in pricing_data.get("plans", [])
+            if plan.get("product") in allowed
+        ]
+
+        sentiment_data = user_sentiment.model_dump(mode="json")
+        per_product = sentiment_data.get("per_product", {})
+        if isinstance(per_product, dict):
+            sentiment_data["per_product"] = {
+                name: value for name, value in per_product.items() if name in allowed
+            }
+
+        return (
+            FeatureMatrix.model_validate(feature_data),
+            PricingComparison.model_validate(pricing_data),
+            UserSentimentAnalysis.model_validate(sentiment_data),
+        )
 
     def _fallback_analysis(
         self,

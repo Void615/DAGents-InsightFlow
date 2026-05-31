@@ -9,9 +9,23 @@ export type WorkflowStatus =
 
 export type ProductCategory = "SaaS / 协作工具" | "移动应用" | "硬件产品";
 
+export interface ProductProfile {
+  canonical_name: string;
+  product_form: string;
+  market_category: string;
+  brand: string;
+  product_line: string;
+  model: string;
+  variant_tier: string;
+  market_segment: string;
+  competition_basis: string[];
+  exclude_relations: string[];
+}
+
 export interface WorkflowConfig {
   target_product: string;
   product_category: ProductCategory;
+  product_profile?: ProductProfile | null;
   focus_dimensions: string[];
   competitor_count: number;
   competitors: string[];

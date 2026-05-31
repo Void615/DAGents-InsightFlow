@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.services.event_service import EventLogger
 from app.schemas.event import EventType
 from app.schemas.competitor import CompetitorInfo, SearchResult
+from app.agents.competitor_resolver import normalize_competitor_name, resolve_competitors
 
 
 # 不同产品类别的搜索意图不同：
@@ -54,7 +55,7 @@ class CollectionAgent(BaseAgent):
         competitor_names = config.get("competitors", []) or []
         competitor_count = config.get("competitor_count", len(competitor_names) or 5)
         competitor_names = competitor_names[:competitor_count]
-        # 目标产品也参与搜索，确保分析时有自身数据做基线对比
+        # 初始产品列表用于无 Tavily 的兜底路径；Tavily 可用时会先解析并替换竞品。
         products = [p for p in [target, *competitor_names] if p]
 
         await self.log_and_broadcast(event_logger, EventType.NODE_START, {
@@ -76,19 +77,71 @@ class CollectionAgent(BaseAgent):
                 collection_errors[product] = "Tavily API key is not configured; skipped live search."
         else:
             client = AsyncTavilyClient(api_key=get_settings().TAVILY_API_KEY)
-            # 所有产品的搜索并发执行，总耗时 = max(单产品耗时) 而非 sum
-            tasks = [
-                self._collect_for_product(client, product, category, focus_dimensions, event_logger, workflow_id)
-                for product in products
+            resolution = await resolve_competitors(
+                client=client,
+                target_product=target,
+                category=category,
+                focus_dimensions=focus_dimensions,
+                competitor_names=competitor_names,
+                competitor_count=competitor_count,
+                product_profile=config.get("product_profile"),
+            )
+            if resolution.dropped or resolution.added:
+                await self.log_and_broadcast(event_logger, EventType.TOOL_RESULT, {
+                    "tool": "competitor_resolver",
+                    "target_product": target,
+                    "product_profile": config.get("product_profile"),
+                    "subcategory": resolution.subcategory,
+                    "query": resolution.query,
+                    "original_competitors": competitor_names,
+                    "resolved_competitors": resolution.competitors,
+                    "dropped": resolution.dropped,
+                    "added": resolution.added,
+                }, workflow_id)
+            competitor_names = resolution.competitors
+            config = {**config, "competitors": competitor_names}
+            competitors = [
+                CompetitorInfo(name=name, category=category).model_dump(mode="json")
+                for name in competitor_names
             ]
-            # gather(return_exceptions=True)：单个产品失败不影响其他产品
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for product, result in zip(products, results):
-                if isinstance(result, Exception):
-                    collection_errors[product] = str(result)[:500]
-                    raw_data[product] = []
-                else:
-                    raw_data[product] = [item.model_dump(mode="json") for item in result]
+            minimum_competitors = 1 if competitor_count <= 1 else min(2, competitor_count)
+            if len(competitor_names) < minimum_competitors:
+                collection_errors["__competitor_resolution__"] = (
+                    f"Only resolved {len(competitor_names)} valid competitor(s); "
+                    f"at least {minimum_competitors} required before analysis."
+                )
+                raw_data = {}
+                products = []
+            else:
+                # 目标产品也参与搜索，确保分析时有自身数据做基线对比。
+                products = [p for p in [target, *competitor_names] if p]
+                raw_data = {product: [] for product in products}
+                # 所有产品的搜索并发执行，总耗时 = max(单产品耗时) 而非 sum
+                tasks = [
+                    self._collect_for_product(client, product, category, focus_dimensions, event_logger, workflow_id)
+                    for product in products
+                ]
+                # gather(return_exceptions=True)：单个产品失败不影响其他产品
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for product, result in zip(products, results):
+                    if isinstance(result, Exception):
+                        collection_errors[product] = str(result)[:500]
+                        raw_data[product] = []
+                    else:
+                        raw_data[product] = [item.model_dump(mode="json") for item in result]
+
+                missing_sources = [
+                    product for product in products
+                    if len(raw_data.get(product, [])) == 0
+                ]
+                missing_competitor_sources = [
+                    product for product in missing_sources
+                    if product != target
+                ]
+                if target in missing_sources or missing_competitor_sources:
+                    collection_errors["__source_coverage__"] = (
+                        "Missing source coverage for: " + ", ".join(missing_sources)
+                    )
 
         duration_ms = int((time.time() - start) * 1000)
         total_sources = sum(len(items) for items in raw_data.values())
@@ -103,6 +156,7 @@ class CollectionAgent(BaseAgent):
         }, workflow_id)
 
         return {
+            "config": config,
             "raw_data": raw_data,
             "collection_errors": collection_errors,
             "competitors": competitors,
@@ -150,6 +204,8 @@ class CollectionAgent(BaseAgent):
                 url = item.get("url", "")
                 if not url or url in seen_urls:
                     continue
+                if not self._result_mentions_product(product, item):
+                    continue
                 seen_urls.add(url)
                 collected.append(SearchResult(
                     url=url,
@@ -166,3 +222,20 @@ class CollectionAgent(BaseAgent):
             "source_count": len(collected),
         }, workflow_id)
         return collected
+
+    def _result_mentions_product(self, product: str, item: dict) -> bool:
+        """Keep a search result only when it is visibly about the queried product."""
+        product_name = normalize_competitor_name(product)
+        if not product_name:
+            return False
+
+        title = str(item.get("title") or "")
+        content = str(item.get("content") or item.get("snippet") or "")
+        text = f"{title}\n{content}".lower()
+        product_lower = product_name.lower()
+        if product_lower in text:
+            return True
+
+        compact_product = product_lower.replace(" ", "")
+        compact_text = text.replace(" ", "")
+        return bool(compact_product and compact_product in compact_text)
