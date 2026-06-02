@@ -25,7 +25,7 @@ async def execute_with_retry(
     state: dict,
     node_name: str,
     event_logger: EventLogger,
-    workflow_id,
+    retry_policy=None,
 ) -> dict:
     """带指数退避重试的节点执行器。
 
@@ -36,12 +36,16 @@ async def execute_with_retry(
       - 每次失败记录 NODE_ERROR 事件（携带业务 error_code）
       - 所有重试耗尽后抛出 NodeFatalError
     """
+    max_retries = getattr(retry_policy, "max_attempts", MAX_RETRIES)
+    timeout = getattr(retry_policy, "timeout_sec", NODE_TIMEOUT)
+    backoff_base = getattr(retry_policy, "backoff_base_sec", 2)
+
     last_error = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             result = await asyncio.wait_for(
-                node_fn(state, event_logger, workflow_id),
-                timeout=NODE_TIMEOUT,
+                node_fn(state),
+                timeout=timeout,
             )
             return result
         except GraphInterrupt:
@@ -56,12 +60,12 @@ async def execute_with_retry(
                     "error_code": inner_code,
                     "error_message": str(e)[:500],
                     "retry_count": attempt,
-                    "max_retries": MAX_RETRIES,
+                    "max_retries": max_retries,
                 },
             )
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(2 ** attempt)
+            if attempt < max_retries:
+                await asyncio.sleep(backoff_base ** attempt)
                 continue
             break
 
-    raise NodeFatalError(node=node_name, attempts=MAX_RETRIES, last_error=last_error)
+    raise NodeFatalError(node=node_name, attempts=max_retries, last_error=last_error)

@@ -1,5 +1,5 @@
 import logging
-import psycopg
+from typing import Any
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.postgres import dict_row
 from app.config import get_settings
@@ -7,11 +7,15 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 _saver: AsyncPostgresSaver | None = None
-_conn: psycopg.AsyncConnection | None = None
+_conn: Any | None = None
 
 
 async def init_checkpointer() -> None:
     global _saver, _conn
+    try:
+        import psycopg
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("psycopg is required to initialize the Postgres checkpointer") from exc
     settings = get_settings()
     _conn = await psycopg.AsyncConnection.connect(
         settings.DATABASE_URL_SYNC,
