@@ -1,3 +1,14 @@
+"""节点执行器 —— 单个 NodeSpec 的运行时执行逻辑。
+
+NodeRunner 负责编译后图的业务节点中实际执行的每一步：
+    1. 构建 AgentContext（注入 EventSink）
+    2. 调用 execute_with_retry（包装 agent.run）
+    3. 处理成功：合并 patch → 更新 control → 保存制品 → 保存状态快照
+    4. 处理失败：保存错误快照 → 重新抛出 NodeFatalError
+
+每个 GraphRuntime.compile() 实例化一个 NodeRunner，所有业务节点共享。
+"""
+
 from __future__ import annotations
 
 import json
@@ -7,19 +18,23 @@ from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.node_executor import NodeFatalError, execute_with_retry
+from app.core.runtime.retry import NodeFatalError, execute_with_retry
 from app.core.runtime.context import AgentContext, EventSink
 from app.core.runtime.template import ArtifactDraft, NodeResult, NodeSpec
 from app.db.models.artifact import Artifact
 from app.db.queries.workflow_queries import get_workflow_by_uuid
 from app.db.models.workflow_node_state import WorkflowNodeState
-from app.exceptions import AppException
 from app.services.event_service import EventLogger
 
 _SKIP_SNAPSHOT_KEYS = {"messages", "raw_data"}
 
 
 def sanitize_for_json(value) -> dict:
+    """将 state dict 转换为 JSON 安全的快照。
+
+    跳过超大 key（messages / raw_data），不可序列化的值转为字符串。
+    用于存入 WorkflowNodeState.state_snapshot。
+    """
     if not isinstance(value, dict):
         return {}
     sanitized = {}
@@ -34,6 +49,19 @@ def sanitize_for_json(value) -> dict:
 
 
 class NodeRunner:
+    """单个节点的运行时执行器。
+
+    在 GraphRuntime.compile() 时创建，被所有业务节点闭包共享。
+    负责：构造 AgentContext → 调用 agent.run（带重试）→ 组装 RuntimeState 返回值。
+
+    Args:
+        db:               数据库会话
+        workflow_id:      工作流 UUID
+        run_id:           本次执行实例 UUID
+        execution_attempt:执行尝试号（用于制品和状态快照的隔离）
+        event_logger:     事件日志器（会自动派生节点级 logger）
+    """
+
     def __init__(
         self,
         db: AsyncSession,
@@ -49,6 +77,23 @@ class NodeRunner:
         self.event_logger = event_logger
 
     async def run(self, spec: NodeSpec, state: dict) -> dict:
+        """执行单个 NodeSpec。
+
+        完整执行流程：
+            1. 拆解 RuntimeState → {data, control, runtime}
+            2. 构造 AgentContext + EventSink
+            3. execute_with_retry 调用 agent.run（含重试逻辑）
+            4. 成功：合并 patch → 更新 control → 保存制品 + 状态快照
+            5. 失败：保存错误快照 → 重新抛出 NodeFatalError
+            6. 组装返回 RuntimeState（被 langgraph 用于下一个节点）
+
+        Args:
+            spec:  要执行的 NodeSpec
+            state: 当前 RuntimeState dict
+
+        Returns:
+            更新后的 RuntimeState dict，data 中已合并 agent 返回的 patch
+        """
         data = dict(state.get("data") or {})
         control = dict(state.get("control") or {})
         runtime = dict(state.get("runtime") or {})
@@ -76,10 +121,7 @@ class NodeRunner:
             )
         except NodeFatalError as exc:
             duration_ms = int((time.time() - start) * 1000)
-            err_msg = str(exc.last_error)
-            if isinstance(exc.last_error, AppException):
-                err_msg = exc.last_error.message
-            await self._save_node_state(spec.id, iteration, data, control, duration_ms, True, err_msg)
+            await self._save_node_state(spec.id, iteration, data, control, duration_ms, True, exc.error_message)
             raise
 
         patch = {key: value for key, value in result.items() if not key.startswith("__")}
@@ -123,6 +165,17 @@ class NodeRunner:
         is_error: bool = False,
         error_message: str | None = None,
     ) -> WorkflowNodeState:
+        """持久化节点执行状态快照到 WorkflowNodeState 表。
+
+        Args:
+            node_name:      节点标识
+            iteration:      修订次数
+            state_snapshot: 经过 sanitize_for_json 处理后的状态快照
+            control:        控制字段（用于未来扩展）
+            duration_ms:    节点执行耗时（毫秒）
+            is_error:       是否为错误快照
+            error_message:  错误消息（仅在 is_error=True 时有值）
+        """
         node_state = WorkflowNodeState(
             id=uuid.uuid4(),
             workflow_id=self.workflow_id,
@@ -141,6 +194,15 @@ class NodeRunner:
         return node_state
 
     async def _save_artifacts(self, spec: NodeSpec, patch: dict, data: dict) -> list[uuid.UUID]:
+        """调用 NodeSpec.artifact_factory 生成并持久化制品列表。
+
+        Args:
+            spec:  当前 NodeSpec
+            patch: agent 返回的 patch
+            data:  合并 patch 后的完整 data
+        Returns:
+            已持久化制品的 UUID 列表
+        """
         if spec.artifact_factory is None:
             return []
         artifact_ids: list[uuid.UUID] = []
@@ -149,6 +211,13 @@ class NodeRunner:
         return artifact_ids
 
     async def _save_artifact(self, draft: ArtifactDraft) -> uuid.UUID:
+        """将单个 ArtifactDraft 持久化到 Artifact 表。
+
+        Args:
+            draft: 由 ArtifactFactory 产出的制品草稿
+        Returns:
+            已持久化制品的 UUID
+        """
         artifact = Artifact(
             id=uuid.uuid4(),
             workflow_id=self.workflow_id,

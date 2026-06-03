@@ -1,3 +1,24 @@
+"""工作流执行编排器 —— 将模板、运行时、持久化层串联为完整执行生命周期。
+
+提供三个对外入口函数，由 API 层通过 BackgroundTasks 调用：
+    run_workflow(workflow_id)      首次执行
+    resume_workflow(workflow_id, decision)  人工决策后恢复
+    recover_workflow(workflow_id)  僵尸恢复（进程崩溃 / 超时后）
+
+执行流程（以 run_workflow 为例）：
+    1. _get_or_create_run    创建/复用 WorkflowRun 记录
+    2. _make_runtime         构建 GraphRuntime（注入 checkpointer）
+    3. runtime.ainvoke       编译并执行 StateGraph
+    4. _handle_graph_result  解析最终状态 → 暂停 / 完成 / 失败
+    5. 异常路径 → _handle_graph_exception（包含 GraphInterrupt 安全网）
+
+内部模块依赖：
+    competitive_template  → GraphTemplate + make_initial_data
+    pause_service         → 暂停生命周期管理（extract / persist / resolve）
+    runtime               → GraphRuntime（编译 + 执行）
+    retry.NodeFatalError  → 统一错误信息提取
+"""
+
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -7,11 +28,11 @@ from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.checkpointer import get_checkpointer
-from app.core.competitive_template import CompetitiveAnalysisTemplate
-from app.core.node_executor import NodeFatalError
+from app.core.competitive_template import CompetitiveAnalysisTemplate, make_initial_data
+from app.core.pause_service import extract_interrupt_payload, make_pause_state, persist_pause, resolve_pause
+from app.core.runtime.retry import NodeFatalError
 from app.core.runtime import GraphRuntime
 from app.db.models.workflow_event import WorkflowEvent
-from app.db.models.workflow_pause import WorkflowPause
 from app.db.models.workflow_run import WorkflowRun
 from app.db.queries.workflow_queries import get_workflow_by_uuid
 from app.db.session import async_session_factory
@@ -24,103 +45,72 @@ from app.services.sse_service import sse_manager
 logger = logging.getLogger(__name__)
 
 
+# ── 内部辅助函数 ─────────────────────────────────────────────────────────
+
 def _thread_id(workflow_id: uuid.UUID, run_id: uuid.UUID) -> str:
+    """生成 langgraph checkpoint 使用的 thread_id。
+
+    格式: "{workflow_id}:{run_id}"
+    """
     return f"{workflow_id}:{run_id}"
 
 
 def _session_factory_for_engine(engine: AsyncEngine | None):
+    """根据可选的引擎参数返回合适的会话工厂。
+
+    engine 为 None 时使用全局 async_session_factory（默认数据库），
+    否则为指定的引擎创建新工厂（用于测试等场景）。
+    """
     if engine is None:
         return async_session_factory
     return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
 def _extract_error_info(e: Exception) -> tuple[str, str, dict | None]:
-    if isinstance(e, NodeFatalError) and isinstance(e.last_error, AppException):
-        app_err = e.last_error
-        return app_err.error_code, app_err.message, app_err.details
+    """从任意异常中提取标准化的错误信息三元组。
+
+    优先使用 NodeFatalError.error_info（封装了 AppException 解包），
+    其次直接处理 AppException，最后回退到通用异常字符串。
+
+    Args:
+        e: 捕获的异常
+    Returns:
+        (error_code, error_message, error_details) 三元组
+    """
+    if isinstance(e, NodeFatalError):
+        return e.error_info
     if isinstance(e, AppException):
         return e.error_code, e.message, e.details
     return "EXECUTION_ERROR", str(e)[:1000], None
 
 
-def _extract_interrupt_payload(final_state: dict | None) -> dict | None:
-    if not isinstance(final_state, dict) or "__interrupt__" not in final_state:
-        return None
-    interrupt_value = final_state.get("__interrupt__")
-    if isinstance(interrupt_value, (list, tuple)) and interrupt_value:
-        interrupt_value = interrupt_value[0]
-    if hasattr(interrupt_value, "value"):
-        interrupt_value = interrupt_value.value
-    elif isinstance(interrupt_value, dict) and "value" in interrupt_value:
-        interrupt_value = interrupt_value["value"]
-    return interrupt_value if isinstance(interrupt_value, dict) else {}
-
-
-def _state_data(final_state: dict | None) -> dict:
-    if not isinstance(final_state, dict):
-        return {}
-    data = final_state.get("data")
-    return data if isinstance(data, dict) else final_state
-
-
 def _state_control(final_state: dict | None) -> dict:
+    """从 RuntimeState 中安全提取 control 层。
+
+    Args:
+        final_state: GraphRuntime 返回的最终状态
+    Returns:
+        control dict，状态无效时返回空 dict
+    """
     if not isinstance(final_state, dict):
         return {}
     control = final_state.get("control")
     return control if isinstance(control, dict) else {}
 
 
-def _review_failed(final_state: dict | None) -> bool:
-    review = _state_data(final_state).get("review_result")
-    if not isinstance(review, dict):
-        return False
-    return review.get("passed") is False
-
-
-def _review_failure_message(final_state: dict | None) -> str:
-    review = _state_data(final_state).get("review_result")
-    if isinstance(review, dict):
-        return str(review.get("feedback") or "报告质检未通过")[:1000]
-    return "报告质检未通过"
-
-
-def _make_pause_state(pause_data: dict) -> dict:
-    return {
-        "paused_by_node": pause_data.get("paused_by_node", ""),
-        "pause_reason": pause_data.get("pause_reason", ""),
-        "pause_options": pause_data.get("pause_options", []),
-        "pause_context": pause_data.get("pause_context", {}),
-        "suggested_route": pause_data.get("suggested_route"),
-        "run_id": pause_data.get("run_id"),
-        "thread_id": pause_data.get("thread_id"),
-        "dag_state": pause_data.get("dag_state", {}),
-        "paused_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _initial_data(workflow) -> dict:
-    return {
-        "config": workflow.config,
-        "competitors": [],
-        "raw_data": {},
-        "collection_errors": {},
-        "context_summaries": {},
-        "feature_matrix": None,
-        "pricing_comparison": None,
-        "user_sentiment": None,
-        "swot": None,
-        "report": None,
-        "review_result": None,
-        "revision_count": 0,
-        "max_revisions": workflow.max_revisions,
-        "current_phase": "collecting",
-        "workflow_status": "running",
-        "errors": [],
-        "messages": [],
-    }
-
+# ── 基础设施 ─────────────────────────────────────────────────────────────
 
 async def _maybe_get_checkpointer(workflow_id: uuid.UUID):
+    """尝试获取 Postgres checkpointer。
+
+    如果 checkpointer 未初始化（例如测试环境），记录警告并返回 None，
+    此时工作流仍可执行但不会持久化 checkpoint（无法恢复）。
+
+    Args:
+        workflow_id: 工作流 UUID（仅用于日志）
+    Returns:
+        AsyncPostgresSaver 或 None
+    """
     try:
         return await get_checkpointer()
     except RuntimeError as exc:
@@ -129,6 +119,18 @@ async def _maybe_get_checkpointer(workflow_id: uuid.UUID):
 
 
 async def _get_or_create_run(db: AsyncSession, workflow) -> WorkflowRun:
+    """获取或创建当前工作流的执行实例。
+
+    逻辑：
+        1. 如果 workflow 已有 current_run_id 且状态为 running/paused，直接复用
+        2. 否则创建新的 WorkflowRun，更新 workflow.current_run_id
+
+    Args:
+        db:       数据库会话
+        workflow: Workflow ORM 对象
+    Returns:
+        当前有效的 WorkflowRun 实例
+    """
     if workflow.current_run_id:
         current = await db.get(WorkflowRun, workflow.current_run_id)
         if current and current.status in ("running", "paused"):
@@ -142,7 +144,7 @@ async def _get_or_create_run(db: AsyncSession, workflow) -> WorkflowRun:
         status="running",
         entrypoint=CompetitiveAnalysisTemplate.entrypoint,
     )
-    # Keep thread_id tied to the persisted run id.
+    # thread_id 绑定到持久化的 run.id
     run.thread_id = _thread_id(workflow.id, run.id)
     db.add(run)
     workflow.current_run_id = run.id
@@ -153,6 +155,16 @@ async def _get_or_create_run(db: AsyncSession, workflow) -> WorkflowRun:
 
 
 async def _get_current_run(db: AsyncSession, workflow) -> WorkflowRun | None:
+    """获取工作流最新的 WorkflowRun。
+
+    先尝试 current_run_id，失败则按 started_at 降序查找最新记录。
+
+    Args:
+        db:       数据库会话
+        workflow: Workflow ORM 对象
+    Returns:
+        WorkflowRun 或 None
+    """
     if workflow.current_run_id:
         run = await db.get(WorkflowRun, workflow.current_run_id)
         if run:
@@ -167,6 +179,19 @@ async def _get_current_run(db: AsyncSession, workflow) -> WorkflowRun | None:
 
 
 def _make_runtime(db, workflow, run, event_logger, checkpointer) -> GraphRuntime:
+    """构建 GraphRuntime 实例。
+
+    将当前工作流上下文注入到运行时中，所有三个入口函数共用此工厂。
+
+    Args:
+        db:           数据库会话
+        workflow:     Workflow ORM 对象
+        run:          WorkflowRun ORM 对象
+        event_logger: EventLogger 实例
+        checkpointer: AsyncPostgresSaver 或 None
+    Returns:
+        已配置的 GraphRuntime 实例
+    """
     return GraphRuntime(
         template=CompetitiveAnalysisTemplate,
         db=db,
@@ -179,65 +204,41 @@ def _make_runtime(db, workflow, run, event_logger, checkpointer) -> GraphRuntime
     )
 
 
-async def _persist_pause(db: AsyncSession, workflow, run: WorkflowRun, pause_state: dict) -> None:
-    previous = await db.execute(
-        select(WorkflowPause).where(
-            WorkflowPause.workflow_id == workflow.id,
-            WorkflowPause.run_id == run.id,
-            WorkflowPause.is_resolved.is_(False),
-        )
-    )
-    for pause in previous.scalars().all():
-        pause.is_resolved = True
-        pause.resolved_at = datetime.now(timezone.utc)
-
-    db.add(WorkflowPause(
-        id=uuid.uuid4(),
-        workflow_id=workflow.id,
-        run_id=run.id,
-        node_name=pause_state.get("paused_by_node") or "",
-        reason=pause_state.get("pause_reason") or "",
-        options=pause_state.get("pause_options") or [],
-        context=pause_state.get("pause_context") or {},
-        suggested_route=pause_state.get("suggested_route"),
-    ))
-
-
-async def _resolve_pause(db: AsyncSession, workflow, run: WorkflowRun, decision: dict) -> None:
-    result = await db.execute(
-        select(WorkflowPause).where(
-            WorkflowPause.workflow_id == workflow.id,
-            WorkflowPause.run_id == run.id,
-            WorkflowPause.is_resolved.is_(False),
-        )
-    )
-    for pause in result.scalars().all():
-        pause.is_resolved = True
-        pause.decision = decision
-        pause.resolved_at = datetime.now(timezone.utc)
-
+# ── 图结果处理 ───────────────────────────────────────────────────────────
 
 async def _handle_graph_result(workflow, run, db, event_logger: EventLogger, final_state: dict) -> None:
-    pause_data = _extract_interrupt_payload(final_state)
+    """处理图执行完成后的最终状态。
+
+    三种结果路径：
+        1. 暂停（interrupt） → 设置 workflow.status="paused"，持久化暂停记录
+        2. 失败（terminal_status="failed"） → 从 control 提取失败原因
+        3. 完成（terminal_status="completed"） → 设置工作流完成状态
+
+    Args:
+        workflow:     Workflow ORM 对象
+        run:          WorkflowRun ORM 对象
+        db:           数据库会话
+        event_logger: EventLogger 实例
+        final_state:  GraphRuntime.ainvoke/aresume/arecover 的返回值
+    """
+    pause_data = extract_interrupt_payload(final_state)
     if pause_data is not None:
         workflow.status = "paused"
         workflow.current_phase = "reviewing"
-        workflow.pause_state = _make_pause_state(pause_data)
+        workflow.pause_state = make_pause_state(pause_data)
         run.status = "paused"
-        await _persist_pause(db, workflow, run, workflow.pause_state)
+        await persist_pause(db, workflow, run, workflow.pause_state)
         await db.commit()
         await event_logger.log(EventType.WORKFLOW_PAUSED, workflow.pause_state, node_name=pause_data.get("paused_by_node", "review"))
         await sse_manager.broadcast(workflow.id, {"event_type": EventType.WORKFLOW_PAUSED.value, **workflow.pause_state})
         return
 
     control = _state_control(final_state)
-    data = _state_data(final_state)
-    workflow.revision_count = int(control.get("revision_count", data.get("revision_count", 0)) or 0)
+    workflow.revision_count = int(control.get("revision_count", 0) or 0)
 
-    if control.get("terminal_status") == "failed" or _review_failed(final_state):
+    if control.get("terminal_status") == "failed":
         workflow.status = "failed"
-        workflow.current_phase = "reviewing"
-        workflow.error_message = control.get("terminal_reason") or _review_failure_message(final_state)
+        workflow.error_message = control.get("terminal_reason") or "工作流执行失败"
         run.status = "failed"
         run.error_message = workflow.error_message
         run.completed_at = datetime.now(timezone.utc)
@@ -245,15 +246,14 @@ async def _handle_graph_result(workflow, run, db, event_logger: EventLogger, fin
         await event_logger.log(
             EventType.WORKFLOW_FAILED,
             {
-                "error_code": "REVIEW_FAILED" if _review_failed(final_state) else "WORKFLOW_FAILED",
+                "error_code": "WORKFLOW_FAILED",
                 "error_message": workflow.error_message,
-                "error_details": data.get("review_result"),
             },
             node_name="__workflow__",
         )
         await sse_manager.broadcast(workflow.id, {
             "event_type": EventType.WORKFLOW_FAILED.value,
-            "error_code": "REVIEW_FAILED",
+            "error_code": "WORKFLOW_FAILED",
             "error_message": workflow.error_message[:200],
         })
         return
@@ -270,12 +270,26 @@ async def _handle_graph_result(workflow, run, db, event_logger: EventLogger, fin
 
 
 async def _handle_graph_exception(workflow, run, db, event_logger: EventLogger, e: Exception) -> None:
+    """处理图执行过程中抛出的异常。
+
+    两种异常路径：
+        1. GraphInterrupt —— langgraph 在无 checkpointer 时抛出的中断异常
+           （安全网：正常情况由 _handle_graph_result 通过 __interrupt__ key 处理）
+        2. 其他异常 —— 记录错误信息，设置工作流为 failed
+
+    Args:
+        workflow:     Workflow ORM 对象
+        run:          WorkflowRun ORM 对象
+        db:           数据库会话
+        event_logger: EventLogger 实例
+        e:            捕获的异常
+    """
     if isinstance(e, GraphInterrupt):
         pause_data = e.args[0] if e.args else {}
         workflow.status = "paused"
-        workflow.pause_state = _make_pause_state(pause_data if isinstance(pause_data, dict) else {})
+        workflow.pause_state = make_pause_state(pause_data if isinstance(pause_data, dict) else {})
         run.status = "paused"
-        await _persist_pause(db, workflow, run, workflow.pause_state)
+        await persist_pause(db, workflow, run, workflow.pause_state)
         await db.commit()
         await event_logger.log(EventType.WORKFLOW_PAUSED, workflow.pause_state, node_name=workflow.pause_state.get("paused_by_node", "review"))
         await sse_manager.broadcast(workflow.id, {"event_type": EventType.WORKFLOW_PAUSED.value, **workflow.pause_state})
@@ -302,13 +316,40 @@ async def _handle_graph_exception(workflow, run, db, event_logger: EventLogger, 
 
 
 async def _get_last_event_time(db, workflow_id: uuid.UUID):
+    """查询工作流最后一次事件的创建时间。
+
+    用于僵尸恢复的时间判断 —— 如果 60s 内有事件，说明工作流仍在活跃运行中。
+
+    Args:
+        db:          数据库会话
+        workflow_id: 工作流 UUID
+    Returns:
+        datetime 或 None
+    """
     result = await db.execute(
         select(sa_func.max(WorkflowEvent.created_at)).where(WorkflowEvent.workflow_id == workflow_id)
     )
     return result.scalar_one_or_none()
 
 
+# ── 公开 API ─────────────────────────────────────────────────────────────
+
 async def run_workflow(workflow_id: uuid.UUID, engine: AsyncEngine | None = None) -> None:
+    """首次启动工作流执行。
+
+    完整流程：
+        1. 获取 workflow，验证状态为 "running"
+        2. 初始化 checkpointer
+        3. 创建/复用 WorkflowRun
+        4. 构建 GraphRuntime → ainvoke(make_initial_data(workflow))
+        5. 处理结果（暂停 / 完成 / 失败）
+
+    由 API 层通过 BackgroundTasks 调用。
+
+    Args:
+        workflow_id: 工作流 UUID
+        engine:      可选的数据库引擎（默认使用全局配置）
+    """
     session_factory = _session_factory_for_engine(engine)
     async with session_factory() as db:
         workflow = await get_workflow_by_uuid(db, workflow_id)
@@ -327,7 +368,7 @@ async def run_workflow(workflow_id: uuid.UUID, engine: AsyncEngine | None = None
 
         try:
             runtime = _make_runtime(db, workflow, run, event_logger, checkpointer)
-            final_state = await runtime.ainvoke(_initial_data(workflow))
+            final_state = await runtime.ainvoke(make_initial_data(workflow))
             await _handle_graph_result(workflow, run, db, event_logger, final_state)
         except Exception as e:
             await _handle_graph_exception(workflow, run, db, event_logger, e)
@@ -337,6 +378,21 @@ async def run_workflow(workflow_id: uuid.UUID, engine: AsyncEngine | None = None
 
 
 async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest, engine: AsyncEngine | None = None) -> None:
+    """人工决策后恢复暂停的工作流。
+
+    完整流程：
+        1. 获取 paused 状态的 workflow
+        2. resolve_pause    —— 标记暂停为已解决 + 记录决策
+        3. runtime.aresume  —— 用 Command(resume=decision) 从 checkpoint 继续
+        4. 处理结果（暂停 / 完成 / 失败）
+
+    由 API 层在 POST /{workflow_id}/decide 后通过 BackgroundTasks 调用。
+
+    Args:
+        workflow_id: 工作流 UUID
+        decision:    用户决策（action + target_node + feedback）
+        engine:      可选的数据库引擎
+    """
     session_factory = _session_factory_for_engine(engine)
     async with session_factory() as db:
         workflow = await get_workflow_by_uuid(db, workflow_id)
@@ -354,7 +410,7 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest, eng
             return
 
         decision_payload = decision.model_dump(mode="json")
-        await _resolve_pause(db, workflow, run, decision_payload)
+        await resolve_pause(db, workflow, run, decision_payload)
         workflow.status = "running"
         workflow.pause_state = None
         run.status = "running"
@@ -376,6 +432,19 @@ async def resume_workflow(workflow_id: uuid.UUID, decision: DecisionRequest, eng
 
 
 async def recover_workflow(workflow_id: uuid.UUID, engine: AsyncEngine | None = None) -> None:
+    """僵尸恢复 —— 从 checkpoint 继续可能已超时/崩溃的工作流。
+
+    安全检查：
+        - 如果最近 60s 内有过事件，说明仍在活跃运行，跳过
+        - 否则从最后一个 langgraph checkpoint 继续执行
+
+    使用 runtime.arecover()（不传 resume 值），
+    langgraph 会自动从 checkpoint 处继续。
+
+    Args:
+        workflow_id: 工作流 UUID
+        engine:      可选的数据库引擎
+    """
     session_factory = _session_factory_for_engine(engine)
     async with session_factory() as db:
         workflow = await get_workflow_by_uuid(db, workflow_id)

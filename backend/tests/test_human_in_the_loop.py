@@ -18,7 +18,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.node_executor import execute_with_retry, NodeFatalError
+from app.core.runtime.retry import execute_with_retry, NodeFatalError
 from app.core.competitive_template import CompetitiveAnalysisTemplate
 from app.core.runtime.policies import ReviewRoutePolicy
 from app.core.runtime.context import AgentContext
