@@ -24,7 +24,7 @@ class WorkflowRun(Base):
         ForeignKey("workflow.id", ondelete="CASCADE"),
         nullable=False,
     )
-    execution_attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    execution_attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     thread_id: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
     entrypoint: Mapped[str] = mapped_column(String(64), nullable=False, default="information_collection")
