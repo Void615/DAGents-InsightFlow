@@ -26,10 +26,10 @@ export function ChatStream({ messages, isStreaming, onQuickReply }: Props) {
       {messages.map((msg, i) => (
         <div key={i} className={`flex w-full ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
           <div
-            className={`max-w-[70%] rounded-2xl px-5 py-4 text-sm ${
+            className={`max-w-[75%] rounded-2xl px-5 py-4 text-sm leading-relaxed ${
               msg.role === "user"
-                ? "bg-emerald-600 text-white rounded-tr-none shadow-md shadow-emerald-900/20"
-                : "bg-[var(--bg-card)] border border-[var(--border)] rounded-tl-none text-[var(--text-primary)] shadow-sm"
+                ? "bg-blue-600 text-white rounded-tr-md shadow-sm"
+                : "bg-white dark:bg-zinc-900 border border-slate-100 dark:border-zinc-800 rounded-tl-md text-slate-800 dark:text-zinc-200 shadow-sm"
             }`}
           >
             {msg.content ? (
@@ -121,8 +121,8 @@ function OptionCard({
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleClick(); }}
       className={`group w-full text-left p-4 rounded-xl border transition-all duration-200 mb-2 cursor-pointer
         ${selected
-          ? "border-emerald-500/50 bg-emerald-500/10 ring-1 ring-emerald-500/20"
-          : "border-[var(--border)] bg-[var(--bg-elevated)] hover:border-emerald-500/30 hover:bg-[var(--bg-card)] hover:-translate-y-0.5 active:scale-[0.99]"
+          ? "border-blue-500/40 bg-blue-500/5 ring-1 ring-blue-500/20"
+          : "border-slate-200 dark:border-zinc-700/50 bg-white dark:bg-zinc-900/50 hover:border-blue-500/30 hover:bg-blue-50/10 dark:hover:bg-blue-500/5 hover:-translate-y-0.5 active:scale-[0.99] shadow-sm"
         }`}
     >
       <div className="flex items-start gap-3">

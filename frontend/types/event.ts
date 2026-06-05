@@ -5,6 +5,7 @@ export type EventType =
   | "node_error"
   | "review_pass"
   | "review_fail"
+  | "review_failed_max_revisions"
   | "reroute"
   | "tool_call"
   | "tool_result"

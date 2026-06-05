@@ -27,14 +27,16 @@ import { OutlineNav } from "@/components/report/outline-nav";
 import { EvidencePanel } from "@/components/report/evidence-panel";
 import { SwotGrid } from "@/components/report/swot-grid";
 import { FeatureMatrixTable } from "@/components/report/feature-matrix-table";
+import { PricingTable } from "@/components/report/pricing-table";
+import { SentimentPanel } from "@/components/report/sentiment-panel";
 import { RevisionTimeline } from "@/components/report/revision-timeline";
-import { Send, ArrowLeft, Layers, FileText } from "lucide-react";
+import { Send, ArrowLeft, Layers, FileText, Sparkles, Pencil, MessageSquare, Network, Download, Printer } from "lucide-react";
 import Link from "next/link";
 import { statusLabel, statusColor } from "@/lib/utils";
 import type { InterviewMessage } from "@/types/interview";
 import type { WorkflowConfig, WorkflowDetail } from "@/types/workflow";
 import type { WorkflowEvent, AgentNodeName } from "@/types/event";
-import type { ReportOutput, SWOTAnalysis, FeatureMatrix } from "@/types/artifact";
+import type { ReportOutput, SWOTAnalysis, FeatureMatrix, PricingComparison, UserSentimentAnalysis } from "@/types/artifact";
 
 const SHOW_DEBUG_EVENTS = process.env.NEXT_PUBLIC_ENABLE_DEBUG_EVENTS === "true";
 
@@ -44,6 +46,8 @@ export default function WorkflowStudioPage() {
   const qc = useQueryClient();
   const { data: workflow, isLoading } = useWorkflow(id);
   const status = workflow?.status;
+  const [titleOverride, setTitleOverride] = useState<string | null>(null);
+  const displayTitle = titleOverride ?? workflow?.title ?? "未命名分析";
 
   if (isLoading) {
     return (
@@ -79,10 +83,22 @@ export default function WorkflowStudioPage() {
   return (
     <AuthGuard>
       <div className="min-h-screen" style={{ backgroundColor: "var(--bg-primary)" }}>
-        <Header workflow={workflow} />
-        {isInterviewStage && <InterviewView workflowId={id} token={token!} workflow={workflow} />}
-        {isRuntimeStage && <DagRuntimeView workflowId={id} token={token!} workflow={workflow} />}
-        {isTerminalStage && <ReportView workflowId={id} workflowStatus={status!} executionAttempt={workflow.execution_attempt} />}
+        <Header workflow={workflow} displayTitle={displayTitle} onTitleChange={(newTitle) => {
+          setTitleOverride(newTitle);
+          qc.setQueryData<WorkflowDetail | undefined>(["workflow", id], (old) =>
+            old ? { ...old, title: newTitle } : old
+          );
+          qc.invalidateQueries({ queryKey: ["workflows"] });
+          const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+          fetch(`${baseUrl}/workflows/${id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ title: newTitle }),
+          }).catch(() => {});
+        }} />
+        {isInterviewStage && <div className="h-[calc(100vh-57px)]"><InterviewView workflowId={id} token={token!} workflow={workflow} /></div>}
+        {isRuntimeStage && <div className="h-[calc(100vh-57px)]"><DagRuntimeView workflowId={id} token={token!} workflow={workflow} /></div>}
+        {isTerminalStage && <TerminalTabs workflowId={id} token={token!} workflow={workflow} />}
         {!isInterviewStage && !isRuntimeStage && !isTerminalStage && (
           <div className="flex h-[calc(100vh-57px)] items-center justify-center">
             <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-6 py-4 text-center max-w-md space-y-3">
@@ -103,7 +119,23 @@ export default function WorkflowStudioPage() {
   );
 }
 
-function Header({ workflow }: { workflow: { title?: string; status?: string; current_phase?: string; revision_count?: number } | undefined }) {
+function Header({ workflow, displayTitle, onTitleChange }: { workflow: { id?: string; title?: string; status?: string; current_phase?: string; revision_count?: number } | undefined; displayTitle?: string; onTitleChange?: (title: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(displayTitle || workflow?.title || "未命名分析");
+  const title = displayTitle || workflow?.title || "未命名分析";
+
+  useEffect(() => {
+    if (!editing) setDraftTitle(displayTitle || workflow?.title || "未命名分析");
+  }, [displayTitle, workflow?.title, editing]);
+
+  const save = () => {
+    const trimmed = draftTitle.trim();
+    if (trimmed && trimmed !== workflow?.title) {
+      onTitleChange?.(trimmed);
+    }
+    setEditing(false);
+  };
+
   return (
     <header className="border-b border-[var(--border)] bg-[var(--bg-primary)]/80 backdrop-blur-xl sticky top-0 z-10">
       <div className="flex items-center justify-between px-6 py-3">
@@ -111,7 +143,21 @@ function Header({ workflow }: { workflow: { title?: string; status?: string; cur
           <Link href="/dashboard" className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors">
             <ArrowLeft size={18} />
           </Link>
-          <h1 className="text-lg font-bold text-[var(--text-primary)]">{workflow?.title || "Workflow"}</h1>
+          {editing ? (
+            <input
+              value={draftTitle}
+              onChange={(e) => setDraftTitle(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") save(); if (e.key === "Escape") setEditing(false); }}
+              onBlur={save}
+              autoFocus
+              className="text-lg font-bold text-[var(--text-primary)] bg-transparent border-b border-emerald-500/50 outline-none px-1"
+            />
+          ) : (
+            <div className="flex items-center gap-2 group cursor-pointer" onClick={() => setEditing(true)} onDoubleClick={() => setEditing(true)}>
+              <h1 className="text-lg font-bold text-[var(--text-primary)]">{title}</h1>
+              <Pencil size={12} className="text-[var(--text-muted)]" />
+            </div>
+          )}
           {workflow?.status && (
             <Badge className={statusColor(workflow.status as Parameters<typeof statusColor>[0]) || ""}>
               {statusLabel(workflow.status as Parameters<typeof statusLabel>[0]) || workflow.status}
@@ -127,25 +173,42 @@ function Header({ workflow }: { workflow: { title?: string; status?: string; cur
 }
 
 /* ─── Interview View ─── */
+const QUICK_CARDS = [
+  { title: "分析一个产品的主要竞品", content: "例如：分析抖音的主要竞品" },
+  { title: "对比多个竞品", content: "例如：抖音、快手、小红书对比分析" },
+  { title: "发现市场机会", content: "例如：短视频赛道还有哪些空白机会" },
+];
+
 function InterviewView({ workflowId, token, workflow }: { workflowId: string; token: string; workflow: WorkflowDetail }) {
-  // 重进入水合：useState 懒初始化从 workflow.config 一次性恢复右侧面板和 isComplete，
-  // 之后用户编辑或 SSE 增量不会被后续 useWorkflow 重取数据覆盖
   const [config, setConfig] = useState<Partial<WorkflowConfig>>(() => {
     const sc = workflow.config as Partial<WorkflowConfig> | undefined;
     return sc && Object.keys(sc).length > 0 ? { ...sc } : {};
   });
   const [isComplete, setIsComplete] = useState<boolean>(() => {
     const sc = workflow.config as Partial<WorkflowConfig> | undefined;
-    // target_product + product_category 都已存在视为"可直接启动"
     return Boolean(sc?.target_product && sc?.product_category);
   });
-  const [messages, setMessages] = useState<InterviewMessage[]>([]);
+  const [messages, setMessages] = useState<InterviewMessage[]>(() => {
+    // 从 React Query 缓存初始化，避免终端状态下 ChatStream 空态闪烁
+    try {
+      const cached = qc.getQueryData<InterviewMessage[]>(["interview-history", workflowId]);
+      return cached ?? [];
+    } catch { return []; }
+  });
   const [inputValue, setInputValue] = useState("");
   const [newCompetitor, setNewCompetitor] = useState("");
   const [startError, setStartError] = useState<string | null>(null);
+  const qc = useQueryClient();
   const { sendMessage, isStreaming } = useInterviewStream({ workflowId, token });
   const startMutation = useStartWorkflow();
-  const { data: history } = useInterviewHistory(workflowId);
+  const { data: history, isLoading: historyLoading, isPending: historyPending } = useInterviewHistory(workflowId);
+  const isTerminalView = workflow.status === "completed" || workflow.status === "failed" || workflow.status === "cancelled";
+
+  // 终端状态的工作流始终视为有消息，避免闪回首页欢迎界面
+  const hasMessages = isTerminalView || (!historyPending && (messages.length > 0 || (!!history && history.length > 0)));
+
+  // ChatStream 展示用消息：优先用 messages state（含流式增量），回退到 history（终端态下 useEffect 尚未触发时）
+  const displayMessages: InterviewMessage[] = messages.length > 0 ? messages : (history ?? []);
 
   useEffect(() => {
     if (history && history.length > 0) {
@@ -153,7 +216,6 @@ function InterviewView({ workflowId, token, workflow }: { workflowId: string; to
     }
   }, [history]);
 
-  // 本地校验：target_product + product_category 必须都存在
   const canStart = Boolean(config.target_product && config.product_category);
 
   const sendUserMessage = (text: string) => {
@@ -186,68 +248,81 @@ function InterviewView({ workflowId, token, workflow }: { workflowId: string; to
           }));
         }
       },
-      // onComplete: stream finished with CONFIG_COMPLETE sentinel — lock config
-      () => {
-        setIsComplete(true);
-      },
+      () => { setIsComplete(true); },
       (err) => console.error("Interview SSE error:", err)
     );
   };
 
   const handleSend = () => sendUserMessage(inputValue);
   const handleQuickReply = (text: string) => sendUserMessage(text);
-  // 解锁继续编辑：让用户在 isComplete=true 后还能继续访谈来修订
-  const handleResumeEditing = () => {
-    setIsComplete(false);
-    setStartError(null);
-  };
+  const handleResumeEditing = () => { setIsComplete(false); setStartError(null); };
 
   const handleStart = async () => {
     setStartError(null);
-    if (!canStart) {
-      setStartError("配置不完整：target_product 和 product_category 必填");
-      return;
-    }
+    if (!canStart) { setStartError("配置不完整：target_product 和 product_category 必填"); return; }
     try {
-      // 将右侧面板编辑的 config 作为权威配置传给后端
       await startMutation.mutateAsync({ id: workflowId, config });
     } catch (err) {
-      const detail =
-        (err as { response?: { data?: { detail?: string; message?: string } } })?.response?.data?.detail
+      const detail = (err as { response?: { data?: { detail?: string; message?: string } } })?.response?.data?.detail
         || (err as { response?: { data?: { detail?: string; message?: string } } })?.response?.data?.message
-        || (err as Error).message
-        || "启动失败";
+        || (err as Error).message || "启动失败";
       setStartError(typeof detail === "string" ? detail : JSON.stringify(detail));
     }
   };
 
-  // 用户编辑右侧面板时清空 startError，避免误导
   const clearStartError = () => { if (startError) setStartError(null); };
 
-  // 安全网：isComplete 翻转但 config 仍空时，从后端拉一次（兼容旧 META 路径）
   useEffect(() => {
     if (!isComplete || canStart) return;
     const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
-    fetch(`${baseUrl}/workflows/${workflowId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    fetch(`${baseUrl}/workflows/${workflowId}`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => r.json())
-      .then((data) => {
-        if (data?.config) {
-          setConfig((prev) => ({ ...data.config, ...prev }));
-        }
-      })
+      .then((data) => { if (data?.config) setConfig((prev) => ({ ...data.config, ...prev })); })
       .catch(() => {});
   }, [isComplete, canStart, workflowId, token]);
 
   return (
-    <div className="flex h-[calc(100vh-57px)]" style={{ backgroundColor: "var(--bg-primary)" }}>
+    <div className="flex h-full" style={{ backgroundColor: "var(--bg-primary)" }}>
+      {/* ── Left: Chat Area ── */}
       <div className="flex flex-col w-[65%] border-r border-[var(--border)]" style={{ backgroundColor: "var(--bg-primary)" }}>
-        <div className="px-5 py-3 border-b border-[var(--border)]">
-          <h2 className="text-sm font-semibold text-[var(--text-primary)]">竞品分析需求访谈</h2>
-          <p className="text-xs text-[var(--text-muted)] mt-0.5">AI 将通过对话引导你完成分析配置</p>
-        </div>
-        <ChatStream messages={messages} isStreaming={isStreaming} onQuickReply={handleQuickReply} />
+        {!hasMessages && !historyLoading && !historyPending ? (
+          /* ── INIT: Welcome ── */
+          <div className="flex-1 flex flex-col items-center justify-center px-6 overflow-y-auto">
+            <div className="max-w-lg w-full space-y-6 text-center">
+              <Sparkles size={36} className="mx-auto text-emerald-400" />
+              <div>
+                <h2 className="text-xl md:text-2xl font-semibold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">
+                  开始一次竞品分析
+                </h2>
+                <p className="text-sm text-slate-500 mt-2 leading-relaxed">
+                  通过自然对话描述你的分析需求，AI 将自动配置分析流程并同步更新右侧看板。
+                </p>
+              </div>
+              <div className="grid grid-cols-1 gap-3 w-full">
+                {QUICK_CARDS.map((card, i) => (
+                  <button
+                    key={i}
+                    onClick={() => sendUserMessage(card.title)}
+                    className="text-left rounded-2xl border border-slate-200 dark:border-zinc-700/50 bg-white dark:bg-zinc-900/50 shadow-sm hover:-translate-y-0.5 hover:border-blue-500/30 hover:bg-blue-50/10 dark:hover:bg-blue-500/5 transition-all cursor-pointer p-4"
+                  >
+                    <p className="text-sm font-medium text-slate-800 dark:text-zinc-200">{card.title}</p>
+                    <p className="text-xs text-slate-500 mt-1">{card.content}</p>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (historyLoading || historyPending) && displayMessages.length === 0 ? (
+          /* ── LOADING ── */
+          <div className="flex-1 flex items-center justify-center">
+            <Spinner size={20} />
+          </div>
+        ) : (
+          /* ── ACTIVE: Chat Stream ── */
+          <ChatStream messages={displayMessages} isStreaming={isStreaming} onQuickReply={handleQuickReply} />
+        )}
+
+        {/* ── Chat Input Bar ── */}
         <div className="p-4 border-t border-[var(--border)]">
           <div className="flex gap-2 max-w-4xl mx-auto">
             <textarea
@@ -258,54 +333,35 @@ function InterviewView({ workflowId, token, workflow }: { workflowId: string; to
                 e.target.style.height = Math.min(e.target.scrollHeight, 192) + "px";
               }}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSend();
-                }
+                if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
               }}
-              placeholder={isStreaming ? "AI 正在回复中..." : "输入回复，或继续追问以完善配置... (Enter 发送，Shift+Enter 换行)"}
+              placeholder={isStreaming ? "AI 正在回复中..." : "输入想分析的产品、竞品范围，或直接点击上方推荐场景..."}
               disabled={isStreaming}
               rows={1}
-              className="flex-1 resize-none rounded-2xl border border-[var(--border)] bg-[var(--bg-elevated)] px-4 py-2.5 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50 focus-visible:border-emerald-500/50 disabled:opacity-50 transition-all"
+              className="flex-1 resize-none rounded-2xl border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900/50 px-4 py-2.5 text-sm text-slate-800 dark:text-zinc-200 placeholder:text-slate-400 dark:placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 focus-visible:border-blue-500/40 disabled:opacity-50 shadow-sm transition-all"
             />
-            <Button onClick={handleSend} disabled={isStreaming} variant="primary" size="icon" className="rounded-xl">
+            <Button onClick={handleSend} disabled={isStreaming || !inputValue.trim()} variant="primary" size="icon" className="rounded-xl">
               <Send size={16} />
             </Button>
           </div>
         </div>
       </div>
+
+      {/* ── Right: Config Panel ── */}
       <div className="w-[35%] p-5 backdrop-blur-xl bg-[var(--bg-primary)]/60 border-l border-[var(--border)]">
         <ConfigPanel
-          config={config}
-          isComplete={isComplete}
-          isStarting={startMutation.isPending}
-          newCompetitor={newCompetitor}
-          canStart={canStart}
-          startError={startError}
+          config={config} isComplete={isComplete} isStarting={startMutation.isPending}
+          newCompetitor={newCompetitor} canStart={canStart} startError={startError}
           onNewCompetitorChange={setNewCompetitor}
           onAddCompetitor={() => {
             if (newCompetitor.trim()) {
-              setConfig((prev) => ({
-                ...prev,
-                competitors: [...(prev.competitors ?? []), newCompetitor.trim()],
-              }));
-              setNewCompetitor("");
-              clearStartError();
+              setConfig((prev) => ({ ...prev, competitors: [...(prev.competitors ?? []), newCompetitor.trim()] }));
+              setNewCompetitor(""); clearStartError();
             }
           }}
-          onRemoveCompetitor={(name) => {
-            setConfig((prev) => ({
-              ...prev,
-              competitors: (prev.competitors ?? []).filter((c) => c !== name),
-            }));
-            clearStartError();
-          }}
-          onConfigChange={(field, value) => {
-            setConfig((prev) => ({ ...prev, [field]: value }));
-            clearStartError();
-          }}
-          onStart={handleStart}
-          onResumeEditing={handleResumeEditing}
+          onRemoveCompetitor={(name) => { setConfig((prev) => ({ ...prev, competitors: (prev.competitors ?? []).filter((c) => c !== name) })); clearStartError(); }}
+          onConfigChange={(field, value) => { setConfig((prev) => ({ ...prev, [field]: value })); clearStartError(); }}
+          onStart={handleStart} onResumeEditing={handleResumeEditing}
         />
       </div>
     </div>
@@ -358,11 +414,11 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
       patchWorkflowCache({
         status: "paused",
         pause_state: {
-          paused_by_node: String((e as Record<string, unknown>).paused_by_node || "review"),
-          pause_reason: String((e as Record<string, unknown>).pause_reason || "等待人工决策"),
-          pause_options: ((e as Record<string, unknown>).pause_options as Array<{ value: string; label: string; target_node?: string }>) || [],
-          pause_context: ((e as Record<string, unknown>).pause_context as Record<string, unknown>) || {},
-          paused_at: String((e as Record<string, unknown>).paused_at || new Date().toISOString()),
+          paused_by_node: String((e as unknown as Record<string, unknown>).paused_by_node || "review"),
+          pause_reason: String((e as unknown as Record<string, unknown>).pause_reason || "等待人工决策"),
+          pause_options: ((e as unknown as Record<string, unknown>).pause_options as Array<{ value: string; label: string; target_node?: string }>) || [],
+          pause_context: ((e as unknown as Record<string, unknown>).pause_context as Record<string, unknown>) || {},
+          paused_at: String((e as unknown as Record<string, unknown>).paused_at || new Date().toISOString()),
         },
       });
     }
@@ -378,9 +434,16 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
       "node_start",
       "node_complete",
       "node_error",
+      "tool_call",
+      "tool_result",
+      "llm_response",
+      "review_pass",
       "review_fail",
+      "review_failed_max_revisions",
       "reroute",
+      "workflow_start",
       "workflow_paused",
+      "workflow_resumed",
       "workflow_failed",
       "workflow_complete",
     ];
@@ -485,6 +548,41 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
       setDeciding(false);
     }
   };
+
+  // Terminal status: just replay historical events (no SSE, no recovery)
+  const isTerminal = workflow.status === "completed" || workflow.status === "failed" || workflow.status === "cancelled";
+  useEffect(() => {
+    if (!isTerminal) return;
+    const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+    fetch(`${baseUrl}/workflows/${workflowId}/events?limit=200&execution_attempt=${executionAttempt}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then((body) => {
+        const events: WorkflowEvent[] = Array.isArray(body) ? body : (body?.items ?? []);
+        if (events.length === 0) return;
+        rebuildFromEvents(events);
+        const rebuilt: Record<AgentNodeName, { status: NodeStatus; message?: string; duration_ms?: number }> = {
+          information_collection: { status: "idle" },
+          analysis: { status: "idle" },
+          report_writing: { status: "idle" },
+          review: { status: "idle" },
+        };
+        let hadReroute = false;
+        for (const e of [...events].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
+          const node = e.node_name as AgentNodeName;
+          if (!node) continue;
+          const p = e.payload as Record<string, unknown> | undefined;
+          if (e.event_type === "node_start") rebuilt[node] = { ...rebuilt[node], status: "active", message: "Running..." };
+          else if (e.event_type === "node_complete") rebuilt[node] = { ...rebuilt[node], status: "completed", message: "Completed", duration_ms: (p?.duration_ms as number) ?? undefined };
+          else if (e.event_type === "node_error") rebuilt[node] = { ...rebuilt[node], status: "failed", message: (p?.error_message as string) || "Error" };
+          else if (e.event_type === "reroute") { rebuilt.review = { ...rebuilt.review, status: "rerouted", message: "Rerouting..." }; hadReroute = true; }
+        }
+        setNodeStates(rebuilt);
+        setHasReroute(hadReroute);
+      })
+      .catch(() => {});
+  }, [workflowId, token, executionAttempt, isTerminal, rebuildFromEvents]);
 
   // Replay current-attempt history on mount, then recover if the workflow is stale.
   useEffect(() => {
@@ -604,12 +702,12 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
   useWorkflowStream({
     workflowId,
     token,
-    enabled: true,
+    enabled: workflow.status === "running" || workflow.status === "paused",
     onEvent: handleEvent,
   });
 
   return (
-    <div className="flex h-[calc(100vh-57px)]" style={{ backgroundColor: "var(--bg-primary)" }}>
+    <div className="flex h-full" style={{ backgroundColor: "var(--bg-primary)" }}>
       {/* Left: DAG Canvas + Dialog Input */}
       <div className="flex-1 flex flex-col p-4 gap-3 min-w-0">
         <div className="flex items-center gap-2 shrink-0">
@@ -710,7 +808,7 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
       </div>
 
       {/* Right: Node process panel */}
-      <div className="w-[400px] border-l border-[var(--border)] flex flex-col min-h-0" style={{ backgroundColor: "var(--bg-primary)" }}>
+      <div className="w-[720px] border-l border-[var(--border)] flex flex-col min-h-0" style={{ backgroundColor: "var(--bg-primary)" }}>
         <div className={`${SHOW_DEBUG_EVENTS ? "flex-[0_0_58%]" : "flex-1"} min-h-0 flex flex-col`}>
           <div className="px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-elevated)]">
             <span className="text-xs font-medium text-[var(--text-primary)]">节点过程叙述</span>
@@ -732,6 +830,45 @@ function DagRuntimeView({ workflowId, token, workflow }: { workflowId: string; t
   );
 }
 
+/* ─── Terminal Tabs ─── */
+type TerminalTab = "interview" | "dag" | "report";
+
+function TerminalTabs({ workflowId, token, workflow }: { workflowId: string; token: string; workflow: WorkflowDetail }) {
+  const [tab, setTab] = useState<TerminalTab>("report");
+
+  const tabs: { key: TerminalTab; label: string; icon: React.ReactNode }[] = [
+    { key: "interview", label: "需求访谈", icon: <MessageSquare size={14} /> },
+    { key: "dag", label: "DAG Runtime Canvas", icon: <Network size={14} /> },
+    { key: "report", label: "分析报告", icon: <FileText size={14} /> },
+  ];
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-57px)]">
+      <div className="flex items-center gap-1 px-6 py-2 border-b border-[var(--border)] bg-[var(--bg-elevated)]">
+        {tabs.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => setTab(t.key)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg transition-all ${
+              tab === t.key
+                ? "bg-[var(--bg-card)] text-[var(--text-primary)] font-medium shadow-sm"
+                : "text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+            }`}
+          >
+            {t.icon}
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="flex-1 min-h-0 relative">
+        {tab === "report" && <ReportView workflowId={workflowId} workflowStatus={workflow.status!} executionAttempt={workflow.execution_attempt} />}
+        {tab === "dag" && <DagRuntimeView workflowId={workflowId} token={token} workflow={workflow} />}
+        {tab === "interview" && <InterviewView workflowId={workflowId} token={token} workflow={workflow} />}
+      </div>
+    </div>
+  );
+}
+
 /* ─── Report View ─── */
 function ReportView({ workflowId, workflowStatus, executionAttempt }: { workflowId: string; workflowStatus: string; executionAttempt: number }) {
   const { token } = useAuth();
@@ -739,6 +876,9 @@ function ReportView({ workflowId, workflowStatus, executionAttempt }: { workflow
   const [fullArtifacts, setFullArtifacts] = useState<Record<string, unknown>>({});
   const [activeCitation, setActiveCitation] = useState<number | null>(null);
   const [activeSection, setActiveSection] = useState<string | null>(null);
+  const [showDownloadConfirm, setShowDownloadConfirm] = useState(false);
+  const [showPdfConfirm, setShowPdfConfirm] = useState(false);
+  const structuredRef = useRef<HTMLDivElement>(null);
 
   const reportArtifact = artifactList?.find((a) => a.artifact_type === "report");
   const reportId = reportArtifact?.id;
@@ -781,6 +921,8 @@ function ReportView({ workflowId, workflowStatus, executionAttempt }: { workflow
   const report = fullArtifacts.report as ReportOutput | undefined;
   const swot = fullArtifacts.swot_analysis as SWOTAnalysis | undefined;
   const featureMatrix = fullArtifacts.feature_matrix as FeatureMatrix | undefined;
+  const pricingComparison = fullArtifacts.pricing_comparison as PricingComparison | undefined;
+  const userSentiment = fullArtifacts.user_sentiment as UserSentimentAnalysis | undefined;
 
   const [revisions, setRevisions] = useState<Array<{ number: number; passed: boolean; targetNode?: string; score?: number }>>([]);
 
@@ -813,7 +955,7 @@ function ReportView({ workflowId, workflowStatus, executionAttempt }: { workflow
   }, [workflowId, workflowStatus, token, executionAttempt]);
 
   return (
-    <div className="h-[calc(100vh-57px)] flex flex-col">
+    <div className="h-full flex flex-col">
       {revisions.length > 0 && (
         <div className="px-6 py-2 border-b border-zinc-800/80">
           <RevisionTimeline revisions={revisions} />
@@ -832,12 +974,26 @@ function ReportView({ workflowId, workflowStatus, executionAttempt }: { workflow
           </TabsList>
         </div>
 
-        <TabsContent value="structured" className="flex-1 overflow-y-auto space-y-6 pb-8">
-          {swot && <SwotGrid swot={swot} />}
-          {featureMatrix && <FeatureMatrixTable data={featureMatrix} />}
-          {!swot && !featureMatrix && (
+        <TabsContent value="structured" className="flex-1 overflow-y-auto pb-8">
+          <div className="flex items-center justify-end">
+            {report?.full_markdown && (
+              <button
+                onClick={() => setShowPdfConfirm(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-xl border border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-emerald-500/30 shadow-sm transition-all"
+              >
+                <Printer size={12} /> 下载 PDF
+              </button>
+            )}
+          </div>
+          <div ref={structuredRef} className="space-y-6">
+          {swot && <div className="print-section"><SwotGrid swot={swot} /></div>}
+          {featureMatrix && <div className="print-section"><FeatureMatrixTable data={featureMatrix} /></div>}
+          {pricingComparison && <div className="print-section"><PricingTable data={pricingComparison} /></div>}
+          {userSentiment && <div className="print-section"><SentimentPanel data={userSentiment} /></div>}
+          {!swot && !featureMatrix && !pricingComparison && !userSentiment && (
             <div className="text-center text-[var(--text-muted)] py-12">加载分析数据中...</div>
           )}
+          </div>
         </TabsContent>
 
         <TabsContent value="markdown" className="flex-1 overflow-hidden">
@@ -852,6 +1008,17 @@ function ReportView({ workflowId, workflowStatus, executionAttempt }: { workflow
               )}
             </aside>
             <main className="flex-1 overflow-y-auto pb-8">
+              <div className="flex items-center justify-between mb-4">
+                <div />
+                {report?.full_markdown && (
+                  <button
+                    onClick={() => setShowDownloadConfirm(true)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-xl border border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-emerald-500/30 shadow-sm transition-all"
+                  >
+                    <Download size={12} /> 下载 Markdown
+                  </button>
+                )}
+              </div>
               {report ? (
                 <ReportViewer
                   report={report}
@@ -862,9 +1029,77 @@ function ReportView({ workflowId, workflowStatus, executionAttempt }: { workflow
                 <div className="text-center text-[var(--text-muted)] py-12">加载报告中...</div>
               )}
             </main>
+            {showDownloadConfirm && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center">
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-6 shadow-xl max-w-sm w-full space-y-4">
+                  <p className="text-sm font-medium text-[var(--text-primary)]">确认下载报告？</p>
+                  <p className="text-xs text-[var(--text-muted)]">文件名：{report?.title || "竞品分析报告"}.md</p>
+                  <div className="flex gap-2 justify-end">
+                    <button
+                      onClick={() => setShowDownloadConfirm(false)}
+                      className="px-4 py-1.5 text-xs rounded-lg border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                    >
+                      取消
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (!report?.full_markdown) return;
+                        const blob = new Blob([report.full_markdown], { type: "text/markdown;charset=utf-8" });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = `${report.title || "竞品分析报告"}.md`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                        setShowDownloadConfirm(false);
+                      }}
+                      className="px-4 py-1.5 text-xs rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white transition-colors"
+                    >
+                      确认下载
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </TabsContent>
       </Tabs>
+      {showPdfConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-6 shadow-xl max-w-sm w-full space-y-4">
+            <p className="text-sm font-medium text-[var(--text-primary)]">确认为 PDF 打印？</p>
+            <p className="text-xs text-[var(--text-muted)]">
+              将在新窗口中打开报告内容并自动弹出打印对话框，选择「另存为 PDF」即可保存。
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setShowPdfConfirm(false)}
+                className="px-4 py-1.5 text-xs rounded-lg border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => {
+                  setShowPdfConfirm(false);
+                  const el = structuredRef.current;
+                  if (!el) return;
+                  const printWindow = window.open("", "_blank");
+                  if (!printWindow) return;
+                  const styles = Array.from(document.querySelectorAll("style, link[rel=stylesheet]"))
+                    .map((s) => s.outerHTML).join("\n");
+                  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${report?.title || "竞品分析报告"}</title>${styles}<style>@page{margin:48px 24px 24px}body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;max-width:900px;margin:0 auto;padding:40px 20px 20px;color:#1a1a1a;-webkit-print-color-adjust:exact;print-color-adjust:exact}.print-title{text-align:center;font-size:22px;font-weight:700;margin-bottom:32px;padding-bottom:16px;border-bottom:2px solid #e5e7eb}.print-section{page-break-after:always;padding-top:24px}.print-section:last-child{page-break-after:auto}@media print{body{margin:0;padding:0}}</style></head><body><h1 class="print-title">结构化看板</h1>${el.innerHTML}</body></html>`;
+                  printWindow.document.write(html);
+                  printWindow.document.close();
+                  printWindow.onload = () => { setTimeout(() => printWindow.print(), 300); };
+                }}
+                className="px-4 py-1.5 text-xs rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white transition-colors"
+              >
+                确认打印
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <EvidencePanel
         citations={report?.citations ?? []}
         traceLinks={traceLinks ?? []}

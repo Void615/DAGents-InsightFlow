@@ -11,10 +11,10 @@ const NODE_LABELS: Record<AgentNodeName, string> = {
 };
 
 const LEVEL_STYLES: Record<string, string> = {
-  info: "border-sky-500/20 bg-sky-500/10 text-sky-100",
-  success: "border-emerald-500/20 bg-emerald-500/10 text-emerald-100",
-  warning: "border-amber-500/20 bg-amber-500/10 text-amber-100",
-  error: "border-rose-500/20 bg-rose-500/10 text-rose-100",
+  info: "border-sky-500/20 bg-sky-500/10 text-sky-700 dark:text-sky-200",
+  success: "border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200",
+  warning: "border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-200",
+  error: "border-rose-500/20 bg-rose-500/10 text-rose-700 dark:text-rose-200",
 };
 
 interface Props {
@@ -47,7 +47,7 @@ export function StreamPanel({ activeNode, selectedNode, entries, onSelectNode }:
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="px-3 py-3 border-b border-[var(--border)] bg-[var(--bg-elevated)] space-y-3">
+      <div className="px-5 py-3 border-b border-[var(--border)] bg-[var(--bg-elevated)] space-y-3">
         <div className="flex items-center gap-2">
           {activeNode ? (
             <>
@@ -87,12 +87,12 @@ export function StreamPanel({ activeNode, selectedNode, entries, onSelectNode }:
         </div>
       </div>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-5 space-y-3">
         {currentEntries.length > 0 ? (
           currentEntries.map((entry, index) => (
             <div
               key={`${entry.node}-${entry.seq ?? index}-${entry.created_at}`}
-              className={`rounded-xl border p-3 ${LEVEL_STYLES[entry.level] || LEVEL_STYLES.info}`}
+              className={`rounded-xl border p-5 ${LEVEL_STYLES[entry.level] || LEVEL_STYLES.info}`}
             >
               <div className="flex items-center justify-between gap-3 text-[10px] uppercase tracking-wide opacity-80">
                 <span>{entry.stage.replaceAll("_", " ")}</span>

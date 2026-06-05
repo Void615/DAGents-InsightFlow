@@ -33,14 +33,14 @@ function DagNodeComponent({ data }: NodeProps<DagNodeData>) {
       animate={status === "active" ? { boxShadow: ["0 0 8px rgba(59,130,246,0.3)", "0 0 24px rgba(59,130,246,0.6)", "0 0 8px rgba(59,130,246,0.3)"] } : {}}
       transition={{ duration: 2, repeat: Infinity }}
       className={cn(
-        "min-w-[200px] rounded-2xl border-2 px-4 py-3 transition-colors duration-500",
+        "min-w-[180px] rounded-xl border px-3 py-2.5 transition-colors duration-500",
         s.bg, s.border,
         status === "active" && "animate-pulse"
       )}
     >
       <Handle type="target" position={Position.Top} className="!bg-[var(--border)]" />
       <div className="flex items-start gap-3">
-        <div className="mt-0.5">
+        <div>
           {status === "active" && <Loader2 className={`h-5 w-5 animate-spin ${s.icon}`} />}
           {status === "completed" && <CheckCircle2 className={`h-5 w-5 ${s.icon}`} />}
           {status === "failed" && <AlertCircle className={`h-5 w-5 ${s.icon}`} />}

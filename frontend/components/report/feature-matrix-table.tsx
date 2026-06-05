@@ -18,9 +18,9 @@ export function FeatureMatrixTable({ data }: Props) {
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-[var(--border)]">
-              <th className="text-left py-2 text-[var(--text-muted)] font-medium">维度</th>
+              <th className="text-left py-2 px-4 text-[var(--text-muted)] font-medium">维度</th>
               {products.map((p) => (
-                <th key={p} className="text-center py-2 text-[var(--text-primary)] font-medium">
+                <th key={p} className="text-center py-2 px-4 text-[var(--text-primary)] font-medium">
                   {p}
                 </th>
               ))}
@@ -29,7 +29,7 @@ export function FeatureMatrixTable({ data }: Props) {
           <tbody>
             {data.matrix.map((row, i) => (
               <tr key={i} className="border-b border-[var(--border)] hover:bg-[var(--bg-elevated)]">
-                <td className="py-2 text-[var(--text-secondary)]">{row.feature_name}</td>
+                <td className="py-2 px-4 text-[var(--text-secondary)]">{row.feature_name}</td>
                 {products.map((p) => {
                   const val = row.products[p];
                   const lower = val?.toLowerCase?.() ?? "";
@@ -37,7 +37,7 @@ export function FeatureMatrixTable({ data }: Props) {
                     lower === "true" || lower === "yes" || lower === "具备" || lower === "支持";
                   const isNegative = lower === "false" || lower === "no" || lower === "—";
                   return (
-                    <td key={p} className="py-2 text-center">
+                    <td key={p} className="py-2 px-4 text-center">
                       {isPositive ? (
                         <Badge variant="success">具备</Badge>
                       ) : isNegative ? (

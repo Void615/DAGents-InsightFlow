@@ -86,6 +86,22 @@ async def start_workflow_endpoint(
     return {"workflow_id": str(workflow.id), "status": workflow.status}
 
 
+@router.patch("/{workflow_id}")
+async def update_workflow(
+    workflow_id: str,
+    body: dict = Body(...),
+    current_user: UserResponse = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    workflow = await get_workflow_by_id(db, workflow_id, current_user.id)
+    if not workflow:
+        raise WorkflowNotFoundError(workflow_id)
+    if "title" in body and isinstance(body["title"], str) and body["title"].strip():
+        workflow.title = body["title"].strip()
+        await db.commit()
+    return {"id": str(workflow.id), "title": workflow.title, "status": workflow.status}
+
+
 @router.delete("/{workflow_id}")
 async def delete_workflow_endpoint(
     workflow_id: str,

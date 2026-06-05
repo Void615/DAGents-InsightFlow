@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef } from "react";
+import { useMemo, useRef, useCallback } from "react";
 import { ReactFlow, Background, Controls, type Node, type Edge, MarkerType } from "reactflow";
 import "reactflow/dist/style.css";
 import { DagNode } from "./dag-node";
@@ -11,9 +11,9 @@ const nodeTypes = { dagNode: DagNode };
 
 const NODE_DEFINITIONS: Array<{ id: AgentNodeName; label: string; position: { x: number; y: number } }> = [
   { id: "information_collection", label: "CollectionAgent\n信息采集", position: { x: 160, y: 0 } },
-  { id: "analysis", label: "AnalysisAgent\n多维分析", position: { x: 160, y: 150 } },
-  { id: "report_writing", label: "ReportAgent\n报告撰写", position: { x: 160, y: 300 } },
-  { id: "review", label: "ReviewAgent\n质量审查", position: { x: 160, y: 450 } },
+  { id: "analysis", label: "AnalysisAgent\n多维分析", position: { x: 160, y: 125 } },
+  { id: "report_writing", label: "ReportAgent\n报告撰写", position: { x: 160, y: 250 } },
+  { id: "review", label: "ReviewAgent\n质量审查", position: { x: 160, y: 375 } },
 ];
 
 export type NodeStatus = "idle" | "active" | "completed" | "failed" | "rerouted";
@@ -26,6 +26,13 @@ interface Props {
 
 export function DagCanvas({ nodeStates, hasReroute, onRetry }: Props) {
   const dataCacheRef = useRef<Map<string, DagNodeData>>(new Map());
+  const rfInstance = useRef<any>(null);
+
+  const onInit = useCallback((instance: any) => {
+    rfInstance.current = instance;
+    // 延迟 fitView，等容器布局完成后再计算
+    setTimeout(() => instance.fitView({ padding: 0.2, duration: 0 }), 100);
+  }, []);
 
   const nodes: Node[] = useMemo(
     () =>
@@ -95,8 +102,8 @@ export function DagCanvas({ nodeStates, hasReroute, onRetry }: Props) {
   }, [nodeStates, hasReroute]);
 
   return (
-    <div className="h-full w-full rounded-2xl border border-[var(--border)] bg-dot-grid overflow-hidden">
-      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} defaultViewport={{ x: 0, y: 0, zoom: 1 }} preventScrolling={false}>
+    <div className="h-full w-full min-h-[300px] min-w-[200px] rounded-2xl border border-[var(--border)] bg-dot-grid overflow-hidden">
+      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={onInit} fitView fitViewOptions={{ padding: 0.2, duration: 0, minZoom: 0.3, maxZoom: 2 }} preventScrolling={false}>
         <Background color="var(--border)" gap={24} size={1} />
         <Controls className="[&>button]:!bg-[var(--bg-card)] [&>button]:!border-[var(--border)] [&>button]:!text-[var(--text-secondary)] [&>button]:!rounded-lg" />
       </ReactFlow>
