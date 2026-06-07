@@ -2,7 +2,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
-from app.agents.agent_utils import invoke_json_model
+from app.agents.agent_utils import invoke_json_model, invoke_structured_model
 from app.core.runtime.context import AgentContext
 from app.schemas.event import EventType
 
@@ -81,3 +81,20 @@ class BaseAgent:
             schema,
             stream_callback=_on_token if stream_response else None,
         )
+
+    async def invoke_structured_llm(
+        self,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        schema: type[T],
+        ctx: AgentContext,
+        task_name: str,
+        *,
+        request_meta: dict[str, Any] | None = None,
+    ) -> T:
+        """Invoke the model using its native JSON-schema response mode."""
+        payload: dict[str, Any] = {"model_task": task_name}
+        if request_meta:
+            payload.update(request_meta)
+        await self.log_and_broadcast(ctx, EventType.LLM_REQUEST, payload)
+        return await invoke_structured_model(system_prompt, user_payload, schema)

@@ -191,10 +191,14 @@ async def test_report_agent_emits_progress_messages():
     }
 
     with patch("app.agents.report_agent.llm_is_configured", return_value=False):
-        result = await agent.run(state, ctx)
+        with pytest.raises(RuntimeError, match="未生成通用 fallback 报告"):
+            await agent.run(state, ctx)
 
-    assert result["report"]["title"] == "Notion 竞品分析报告"
-    assert agent.emit_progress.await_count >= 3
+    assert agent.emit_progress.await_count >= 2
+    assert not any(
+        call.kwargs.get("stage") == "finalize_report"
+        for call in agent.emit_progress.await_args_list
+    )
 
 
 @pytest.mark.asyncio

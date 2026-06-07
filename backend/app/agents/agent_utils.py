@@ -253,6 +253,36 @@ async def invoke_json_model(
             ) from second_error
 
 
+@traceable(run_type="llm", name="invoke_native_structured_output")
+async def invoke_structured_model(
+    system_prompt: str,
+    user_payload: dict[str, Any],
+    schema: type[T],
+) -> T:
+    """Use the provider's native tool/function-calling response mode.
+
+    Unlike ``invoke_json_model``, this path never extracts JSON from free-form
+    text and never asks the model to repair a malformed text response. It is
+    intended for bounded outputs whose failure must remain visible to the
+    caller instead of being converted into a lower-quality fallback artifact.
+    Function calling is used instead of ``response_format=json_schema`` because
+    some OpenAI-compatible providers do not support the latter.
+    """
+    llm = make_chat_model()
+    structured_llm = llm.with_structured_output(
+        schema,
+        method="function_calling",
+        strict=True,
+    )
+    result = await structured_llm.ainvoke([
+        ("system", system_prompt),
+        ("human", json.dumps(user_payload, ensure_ascii=False, default=str)),
+    ])
+    if isinstance(result, schema):
+        return result
+    return schema.model_validate(result)
+
+
 def truncate_text(text: str, limit: int = 1200) -> str:
     """压缩空白并截断文本到指定长度。
 

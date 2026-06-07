@@ -1,3 +1,4 @@
+import re
 import time
 from datetime import datetime, date
 from app.agents.base_agent import BaseAgent
@@ -9,18 +10,42 @@ from pydantic import BaseModel
 
 
 class ReportDraft(BaseModel):
-    """LLM 返回的报告草稿结构。
-
-    Markdown 由后端根据 sections 确定性渲染，避免模型重复输出同一份报告。
-    """
+    """Decision-focused report batch that also defines report metadata."""
     title: str
     executive_summary: str
     sections: list[ReportSection]
 
 
-REPORT_SYSTEM_PROMPT = """你是专业中文商业分析报告撰写助手。请基于输入的结构化竞品分析和来源摘要写一份 Markdown 竞品分析报告。
+class ReportSectionBatch(BaseModel):
+    """A bounded group of report sections."""
+    sections: list[ReportSection]
+
+
+ANALYSIS_HEADINGS = [
+    "分析目标",
+    "产品定位判断",
+    "竞品范围与角色判断",
+    "关键发现",
+    "成功与失败原因拆解",
+]
+DECISION_HEADINGS = ["结论先行", "对当前项目的启示", "行动建议"]
+SUPPLEMENT_HEADINGS = ["上市与增长拆解", "关键流程图"]
+REPORT_HEADINGS = [
+    "分析目标",
+    "结论先行",
+    "产品定位判断",
+    "竞品范围与角色判断",
+    "关键发现",
+    "成功与失败原因拆解",
+    "上市与增长拆解",
+    "关键流程图",
+    "对当前项目的启示",
+    "行动建议",
+]
+
+
+REPORT_SYSTEM_PROMPT = """你是专业中文商业分析报告撰写助手。请基于输入的结构化竞品分析撰写指定章节。
 要求：
-- 只输出一个合法 JSON 对象，不要 Markdown 代码块，不要额外解释。
 - 报告语言默认中文。
 - 不要编造未在分析结果或来源中出现的事实；不确定时明确写"当前采集结果未覆盖"，不要断言公开来源不存在。
 - 报告不是简单复述“别人做了什么”，而是要回答“这对当前项目有什么用”。
@@ -30,27 +55,22 @@ REPORT_SYSTEM_PROMPT = """你是专业中文商业分析报告撰写助手。请
 - 如果 config.competitor_groups 中已有角色判断，请将其视为对已选竞品的角色标签，而不是要求每个标签都必须有对象。
 - 如果用户只分析 1 个竞品，也可以成立；需要说明这个竞品在当前细分市场里更接近什么角色，以及这种选择对本次分析意味着什么。
 - 如果来源里能支撑，继续拆解上市节奏、平台组合、内容策略、投放动作和商业结果；如果证据不足，要明确指出边界。
-- sections 必须至少包含以下章节：
-  1. 分析目标
-  2. 结论先行
-  3. 产品定位判断
-  4. 竞品范围与角色判断
-  5. 关键发现
-  6. 成功与失败原因拆解
-  7. 上市与增长拆解
-  8. 关键流程图
-  9. 对当前项目的启示
-  10. 行动建议
-- sections 每个对象包含 heading、level、content、source_refs。
+- 只生成 requested_headings 指定的章节，heading 必须逐字匹配且每章只出现一次。
+- sections 每个对象必须包含 heading、level、content、source_refs。
+- source_refs 只能使用输入中真实存在的 URL；没有直接来源时使用空数组。
+- content 必须保留 Markdown 换行；标题、列表项和代码围栏禁止写在同一行。
+- content 中禁止使用 #、##、### 等标题语法；需要小标题时使用独占一行的 **粗体标题**。
+- 编号列表的每一项必须独占一行，格式为“1. 内容”。
 - “关键发现”和“行动建议”必须可执行，避免空泛表述。
-- “关键流程图”的 content 优先输出 Mermaid 流程图；如果证据不足，也要明确写出流程假设与证据边界。
+- “关键流程图”的 content 必须使用独立 Mermaid 代码块，严格格式如下：
+  ```mermaid
+  flowchart LR
+    A[步骤一] --> B[步骤二]
+  ```
+- Mermaid 开始围栏、flowchart 声明、每条连线和结束围栏必须各自独占一行。
+- 如果证据不足，也要在 Mermaid 代码块之外明确写出流程假设与证据边界。
 - 如果当前采集结果不足以支撑结论，要明确指出证据边界，不要假装确定。
-JSON schema:
-{
-  "title": "...",
-  "executive_summary": "...",
-  "sections": [{"heading": "...", "level": 2, "content": "...", "source_refs": ["url"]}]
-}"""
+"""
 
 
 class ReportAgent(BaseAgent):
@@ -59,8 +79,8 @@ class ReportAgent(BaseAgent):
     async def run(self, state: dict, ctx: AgentContext) -> dict:
         """将结构化分析产物组装为 Markdown 竞品分析报告。
 
-        LLM 可用时：调用 invoke_llm 生成报告草稿，再追加引用列表。
-        LLM 不可用时：走 _fallback_report 用规则模板拼装。
+        正式报告分三批使用模型原生 structured output 生成。任一批失败时
+        直接向上传播异常，由节点重试机制处理，禁止交付通用 fallback 报告。
         """
         config = state.get("config", {})
         if not isinstance(config, dict):
@@ -106,63 +126,22 @@ class ReportAgent(BaseAgent):
             await self.emit_progress(
                 ctx,
                 stage="draft_report",
-                message="正在撰写执行摘要，并整合功能、定价、反馈与 SWOT 内容。",
+                message="正在分三批撰写分析、决策与补充章节。",
             )
-            try:
-                draft = await self.invoke_llm(
-                    REPORT_SYSTEM_PROMPT,
-                    {
-                        "config": config,
-                        "feature_matrix": state.get("feature_matrix"),
-                        "pricing_comparison": state.get("pricing_comparison"),
-                        "user_sentiment": state.get("user_sentiment"),
-                        "positioning_analysis": state.get("positioning_analysis"),
-                        "swot": state.get("swot"),
-                        "competitor_role_analysis": state.get("competitor_role_analysis"),
-                        "gtm_analysis": state.get("gtm_analysis"),
-                        "sources_by_product": raw_data_to_context(raw_data, max_items_per_product=4),
-                        "collection_errors": collection_errors,
-                        "source_coverage_issue": source_coverage_issue,
-                    },
-                    ReportDraft,
-                    ctx, "report_writing",
-                    request_meta={"target_product": target},
-                    stream_response=False,
-                )
-                await self.log_and_broadcast(ctx, EventType.LLM_RESPONSE, {
-                    "model_task": "report_writing",
-                    "sections_count": len(draft.sections),
-                })
-                report = ReportOutput(
-                    title=draft.title,
-                    executive_summary=draft.executive_summary,
-                    sections=draft.sections,
-                    citations=citations,
-                    full_markdown=self._render_markdown(draft.title, draft.executive_summary, draft.sections, citations),
-                    generated_at=datetime.utcnow(),
-                )
-                await self.emit_progress(
-                    ctx,
-                    stage="report_draft_ready",
-                    message=f"报告草稿已生成，当前包含 {len(draft.sections)} 个主要章节。",
-                    level="success",
-                )
-            except Exception as exc:
-                await self.emit_progress(
-                    ctx,
-                    stage="fallback_report",
-                    message=f"模型报告生成失败，已使用现有结构化分析生成模板报告：{str(exc)[:160]}",
-                    level="warning",
-                )
-                report = self._fallback_report(target, config, state, citations)
+            report = await self._generate_report_batches(
+                state=state,
+                ctx=ctx,
+                config=config,
+                target=target,
+                raw_data=raw_data,
+                collection_errors=collection_errors,
+                source_coverage_issue=source_coverage_issue,
+                citations=citations,
+            )
         else:
-            await self.emit_progress(
-                ctx,
-                stage="fallback_report",
-                message="未使用实时模型写作，当前将基于结构化结果生成模板化报告。",
-                level="warning",
+            raise RuntimeError(
+                "正式报告生成需要可用 LLM；未生成通用 fallback 报告"
             )
-            report = self._fallback_report(target, config, state, citations)
 
         duration_ms = int((time.time() - start) * 1000)
         await self.emit_progress(
@@ -184,6 +163,249 @@ class ReportAgent(BaseAgent):
             "report": report.model_dump(mode="json"),
             "current_phase": "writing",
         }
+
+    async def _generate_report_batches(
+        self,
+        *,
+        state: dict,
+        ctx: AgentContext,
+        config: dict,
+        target: str,
+        raw_data: dict,
+        collection_errors: dict,
+        source_coverage_issue: str | None,
+        citations: list[Citation],
+    ) -> ReportOutput:
+        """Generate three bounded structured batches and assemble one report."""
+        sources = raw_data_to_context(raw_data, max_items_per_product=2)
+        shared = {
+            "config": config,
+            "collection_errors": collection_errors,
+            "source_coverage_issue": source_coverage_issue,
+        }
+
+        analysis_batch = await self._generate_section_batch(
+            ctx=ctx,
+            batch_name="analysis",
+            headings=ANALYSIS_HEADINGS,
+            payload={
+                **shared,
+                "feature_matrix": state.get("feature_matrix"),
+                "pricing_comparison": state.get("pricing_comparison"),
+                "user_sentiment": state.get("user_sentiment"),
+                "positioning_analysis": state.get("positioning_analysis"),
+                "competitor_role_analysis": state.get("competitor_role_analysis"),
+                "sources_by_product": sources,
+            },
+        )
+        decision_draft = await self.invoke_structured_llm(
+            REPORT_SYSTEM_PROMPT,
+            {
+                **shared,
+                "requested_headings": DECISION_HEADINGS,
+                "analysis_sections": [
+                    section.model_dump(mode="json") for section in analysis_batch
+                ],
+                "pricing_comparison": state.get("pricing_comparison"),
+                "swot": state.get("swot"),
+            },
+            ReportDraft,
+            ctx,
+            "report_writing:decision",
+            request_meta={"target_product": target, "batch": "decision"},
+        )
+        decision_sections = self._validate_sections(
+            decision_draft.sections, DECISION_HEADINGS, "decision"
+        )
+        await self._log_batch_response(ctx, "decision", len(decision_sections))
+
+        supplement_batch = await self._generate_section_batch(
+            ctx=ctx,
+            batch_name="supplement",
+            headings=SUPPLEMENT_HEADINGS,
+            payload={
+                **shared,
+                "positioning_analysis": state.get("positioning_analysis"),
+                "gtm_analysis": state.get("gtm_analysis"),
+                "analysis_sections": [
+                    section.model_dump(mode="json") for section in analysis_batch
+                ],
+            },
+        )
+
+        all_sections = analysis_batch + decision_sections + supplement_batch
+        sections_by_heading = {section.heading: section for section in all_sections}
+        ordered_sections = [sections_by_heading[heading] for heading in REPORT_HEADINGS]
+        report = ReportOutput(
+            title=decision_draft.title,
+            executive_summary=decision_draft.executive_summary,
+            sections=ordered_sections,
+            citations=citations,
+            full_markdown=self._render_markdown(
+                decision_draft.title,
+                decision_draft.executive_summary,
+                ordered_sections,
+                citations,
+            ),
+            generated_at=datetime.utcnow(),
+        )
+        await self.emit_progress(
+            ctx,
+            stage="report_draft_ready",
+            message="三批结构化章节均已生成，正在组装最终报告。",
+            level="success",
+        )
+        return report
+
+    async def _generate_section_batch(
+        self,
+        *,
+        ctx: AgentContext,
+        batch_name: str,
+        headings: list[str],
+        payload: dict,
+    ) -> list[ReportSection]:
+        batch = await self.invoke_structured_llm(
+            REPORT_SYSTEM_PROMPT,
+            {**payload, "requested_headings": headings},
+            ReportSectionBatch,
+            ctx,
+            f"report_writing:{batch_name}",
+            request_meta={"batch": batch_name},
+        )
+        sections = self._validate_sections(batch.sections, headings, batch_name)
+        await self._log_batch_response(ctx, batch_name, len(sections))
+        return sections
+
+    async def _log_batch_response(
+        self, ctx: AgentContext, batch_name: str, sections_count: int
+    ) -> None:
+        await self.log_and_broadcast(ctx, EventType.LLM_RESPONSE, {
+            "model_task": f"report_writing:{batch_name}",
+            "batch": batch_name,
+            "sections_count": sections_count,
+        })
+
+    def _validate_sections(
+        self,
+        sections: list[ReportSection],
+        expected_headings: list[str],
+        batch_name: str,
+    ) -> list[ReportSection]:
+        by_heading = {section.heading: section for section in sections}
+        if len(by_heading) != len(sections):
+            raise ValueError(f"Report batch '{batch_name}' contains duplicate headings")
+        missing = [heading for heading in expected_headings if heading not in by_heading]
+        unexpected = [heading for heading in by_heading if heading not in expected_headings]
+        if missing or unexpected:
+            raise ValueError(
+                f"Report batch '{batch_name}' headings mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        normalized = [
+            self._normalize_section(by_heading[heading])
+            for heading in expected_headings
+        ]
+        for section in normalized:
+            if re.search(r"#{1,6}\s+", section.content):
+                raise ValueError(
+                    f"Report section '{section.heading}' contains unsupported Markdown heading syntax"
+                )
+            if section.heading == "关键流程图":
+                self._validate_mermaid_section(section)
+        return normalized
+
+    def _normalize_section(self, section: ReportSection) -> ReportSection:
+        """Normalize common model-produced Markdown formatting mistakes."""
+        content = str(section.content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        content = self._normalize_inline_headings(content)
+        content = self._normalize_numbered_lists(content)
+        if section.heading == "关键流程图":
+            content = self._normalize_mermaid(content)
+        content = re.sub(r"\n{3,}", "\n\n", content).strip()
+        return section.model_copy(update={"content": content})
+
+    @staticmethod
+    def _normalize_inline_headings(content: str) -> str:
+        # Models sometimes collapse "### 小标题" and the first list item onto
+        # one line. Report sections already have an outer heading, so render
+        # inner headings as bold labels instead of allowing heading styles to
+        # leak across the whole paragraph.
+        content = re.sub(
+            r"(^|[。；;.!?！？\n])\s*#{1,6}\s*([^#\n\d]{2,40}?)(?=\d+\.\s*)",
+            lambda match: f"{match.group(1)}\n\n**{match.group(2).strip()}**\n\n",
+            content,
+            flags=re.MULTILINE,
+        )
+        content = re.sub(
+            r"(?m)^\s*#{1,6}\s+([^\n]+)$",
+            lambda match: f"**{match.group(1).strip()}**",
+            content,
+        )
+        return content
+
+    @staticmethod
+    def _normalize_numbered_lists(content: str) -> str:
+        # Insert a Markdown list boundary after Chinese/English sentence
+        # punctuation when the model flattened multiple numbered items.
+        content = re.sub(r"([。；;])\s*(\d+\.)\s*", r"\1\n\n\2 ", content)
+        return re.sub(r"(?<!^)(?<!\n)(\d+\.)\s+", r"\n\n\1 ", content)
+
+    @staticmethod
+    def _normalize_mermaid(content: str) -> str:
+        content = re.sub(
+            r"([^\n])\s*```mermaid\s*(?=(?:flowchart|graph)\b)",
+            r"\1\n\n```mermaid\n",
+            content,
+            flags=re.IGNORECASE,
+        )
+        content = re.sub(
+            r"```mermaid\s*(?=(?:flowchart|graph)\b)",
+            "```mermaid\n",
+            content,
+            flags=re.IGNORECASE,
+        )
+        opening = re.search(r"```mermaid\n", content, flags=re.IGNORECASE)
+        if not opening:
+            return content
+
+        closing_start = content.find("```", opening.end())
+        if closing_start == -1:
+            return content
+
+        chart = content[opening.end():closing_start].strip()
+        chart = re.sub(
+            r"\s+([A-Za-z][A-Za-z0-9_]*)\s*(-->|---)",
+            lambda match: f"\n  {match.group(1)} {match.group(2)}",
+            chart,
+        )
+        normalized_block = f"```mermaid\n{chart}\n```"
+        before = content[:opening.start()].rstrip()
+        after = content[closing_start + 3:].strip()
+        parts = [part for part in (before, normalized_block, after) if part]
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _validate_mermaid_section(section: ReportSection) -> None:
+        matches = re.findall(
+            r"```mermaid\n(.*?)\n```",
+            section.content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                "Report section '关键流程图' must contain exactly one valid Mermaid code block"
+            )
+        chart = matches[0].strip()
+        if not re.match(r"^(?:flowchart|graph)\s+(?:TB|TD|BT|RL|LR)\b", chart, flags=re.IGNORECASE):
+            raise ValueError("Mermaid chart must start with a valid flowchart or graph declaration")
+        if "-->" not in chart and "---" not in chart:
+            raise ValueError("Mermaid chart must contain at least one connection")
+        for opening, closing in (("[", "]"), ("{", "}"), ("(", ")")):
+            if chart.count(opening) != chart.count(closing):
+                raise ValueError(
+                    f"Mermaid chart has unbalanced delimiters: {opening}{closing}"
+                )
 
     def _insufficient_report(self, target: str, reason: str, citations: list[Citation]) -> ReportOutput:
         title = f"{target} 竞品分析报告（资料不足，未完成）"

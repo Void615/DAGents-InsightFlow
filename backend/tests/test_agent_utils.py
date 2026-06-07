@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -7,6 +7,7 @@ from app.agents import agent_utils
 from app.agents.agent_utils import _normalize_schema_payload
 from app.schemas.feature import FeatureMatrix
 from app.schemas.gtm import GTMAnalysis
+from app.schemas.pricing import PricingComparison
 
 
 def _feature_payload():
@@ -83,3 +84,27 @@ async def test_invoke_json_model_normalizes_evidence_refs_without_repair(monkeyp
 
     assert result.launch_rhythm.evidence_refs[0].url == "https://example.com/launch"
     assert llm.ainvoke.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_invoke_structured_model_uses_native_json_schema(monkeypatch):
+    result = PricingComparison(plans=[], summary="No confirmed pricing")
+    structured_llm = SimpleNamespace(ainvoke=AsyncMock(return_value=result))
+    llm = SimpleNamespace(
+        with_structured_output=MagicMock(return_value=structured_llm),
+    )
+    monkeypatch.setattr(agent_utils, "make_chat_model", lambda: llm)
+
+    actual = await agent_utils.invoke_structured_model(
+        "system",
+        {"target": "Notion"},
+        PricingComparison,
+    )
+
+    assert actual == result
+    llm.with_structured_output.assert_called_once_with(
+        PricingComparison,
+        method="function_calling",
+        strict=True,
+    )
+    structured_llm.ainvoke.assert_awaited_once()

@@ -46,6 +46,7 @@ export function useInterviewStream({ workflowId, token }: UseInterviewStreamOpti
         let inMeta = false;
         let eventType = "message";
         let receivedContent = false;
+        let receivedMeta = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -81,6 +82,7 @@ export function useInterviewStream({ workflowId, token }: UseInterviewStreamOpti
             if (inMeta) {
               try {
                 const parsed = JSON.parse(data) as InterviewSSEMessage;
+                receivedMeta = true;
                 if (parsed.extracted_config || parsed.suggested_competitors) {
                   onConfig(parsed);
                 }
@@ -99,7 +101,7 @@ export function useInterviewStream({ workflowId, token }: UseInterviewStreamOpti
             }
           }
         }
-        if (!receivedContent) {
+        if (!receivedContent && !receivedMeta) {
           throw new Error("AI 没有生成有效回复，请重试。");
         }
       } catch (err) {

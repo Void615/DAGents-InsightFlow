@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import List, AsyncGenerator, Callable
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 INTERVIEW_RESPONSE_TIMEOUT_SECONDS = 120
 EMPTY_RESPONSE_FALLBACK = "刚才没有生成有效回复。请重新发送一次，或补充说明您希望继续确认的内容。"
+CONFIG_UPDATED_FALLBACK = "配置已更新。请确认是否可以开始分析，或继续提出修改。"
+CONFIG_COMPLETE_FALLBACK = "配置已确认完成，可以开始竞品分析。"
 
 _tavily_client: AsyncTavilyClient | None = None
 _interview_agent: InterviewAgent | None = None
@@ -170,6 +173,19 @@ async def _collect_interview_response(
     return EMPTY_RESPONSE_FALLBACK
 
 
+def _clean_interview_response(full_response: str, *, has_config: bool, is_complete: bool) -> str:
+    """Remove machine-readable config output while keeping a visible assistant reply."""
+    without_fences = re.sub(r"```(?:json)?\s*.*?```", "", full_response, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = without_fences.replace("---CONFIG_COMPLETE---", "").strip()
+    if cleaned:
+        return cleaned
+    if is_complete:
+        return CONFIG_COMPLETE_FALLBACK
+    if has_config:
+        return CONFIG_UPDATED_FALLBACK
+    return EMPTY_RESPONSE_FALLBACK
+
+
 async def stream_interview_response(
     db: AsyncSession,
     workflow_id: uuid.UUID,
@@ -224,8 +240,11 @@ async def stream_interview_response(
             await db.commit()
 
     # -- Phase C: 清洗 -------------------------------------------------------
-    # 取第一个 ``` 之前的文本作为聊天内容（丢弃 JSON 代码块和 ---CONFIG_COMPLETE---）
-    cleaned_response = full_response.split("```", 1)[0].strip()
+    cleaned_response = _clean_interview_response(
+        full_response,
+        has_config=config is not None,
+        is_complete=is_complete,
+    )
 
     # -- Phase D: 持久化清洗后的消息 ------------------------------------------
     await save_message(db, workflow_id, "assistant", cleaned_response)
