@@ -22,6 +22,13 @@ class Settings(BaseSettings):
 
     TAVILY_API_KEY: str = ""
 
+    ALLOWED_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    @property
+    def cors_origins(self) -> list[str]:
+        """将逗号分隔的 ALLOWED_ORIGINS 解析为列表。"""
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
     LANGSMITH_API_KEY: str = ""
     LANGSMITH_PROJECT: str = "dagents-insightflow"
     LANGSMITH_TRACING_V2: bool = False

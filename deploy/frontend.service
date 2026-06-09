@@ -1,0 +1,23 @@
+[Unit]
+Description=DAGents-InsightFlow Frontend (Next.js)
+After=network.target dagents-backend.service
+Wants=dagents-backend.service
+
+[Service]
+Type=simple
+User=dagents
+Group=dagents
+WorkingDirectory=/opt/dagents/frontend
+EnvironmentFile=/opt/dagents/frontend/.env.production
+ExecStart=/usr/bin/node /opt/dagents/frontend/node_modules/.bin/next start --port 3000
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

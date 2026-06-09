@@ -1,0 +1,23 @@
+[Unit]
+Description=DAGents-InsightFlow Backend (FastAPI)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=dagents
+Group=dagents
+WorkingDirectory=/opt/dagents/backend
+EnvironmentFile=/opt/dagents/backend/.env
+ExecStart=/opt/dagents/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2 --log-level info
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

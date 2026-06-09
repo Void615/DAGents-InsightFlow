@@ -12,6 +12,7 @@ import app.core.dependency.langsmith  # noqa: F401  side-effect: 注入 os.envir
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from app.config import get_settings
 from app.api.v1.router import v1_router
 from app.db.base import Base
 from app.db.session import engine
@@ -19,6 +20,8 @@ from app.core.dependency.checkpointer import init_checkpointer, shutdown_checkpo
 from app.exceptions import AppException
 
 logger = logging.getLogger(__name__)
+
+_settings = get_settings()
 
 
 @asynccontextmanager
@@ -35,11 +38,7 @@ app = FastAPI(title="DAGents-InsightFlow", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)(:\d+)?$",
+    allow_origins=_settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
