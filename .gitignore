@@ -6,6 +6,7 @@
 
 # env
 *.env
+!.env.docker
 
 # test
 *.pytest_cache
