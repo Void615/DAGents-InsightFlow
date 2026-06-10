@@ -71,8 +71,10 @@ AI 驱动的竞品分析多 Agent 协作系统。
 - 用户注册/登录（bcrypt 密码哈希 + JWT 认证，24h 过期）
 - API 限流（登录 10 次/min/IP，注册 5 次/min/IP）
 
-![注册](images/注册.png)
-![登录](images/登录.png)
+<img src="images/注册.png" width="80%">
+
+<img src="images/登录.png" width="80%">
+
 
 **工作流管理**
 
@@ -87,7 +89,7 @@ AI 驱动的竞品分析多 Agent 协作系统。
 - Tavily 自动推荐竞品（竞品实体消歧 + 分类策略匹配 smartphone/drone/SaaS）
 - 智能完成检测——识别用户确认信号，自动判定访谈结束
 
-![配置确认](images\配置确认.png)
+<img src="images/配置确认.png" width="80%">
 
 **DAG 工作流执行**
 
@@ -96,7 +98,7 @@ AI 驱动的竞品分析多 Agent 协作系统。
 - Postgres Checkpoint 持久化（`thread_id = "{workflow_id}:{run_id}"`，支持崩溃恢复）
 - 节点指数退避重试（最多 3 次，5 分钟超时，`GraphInterrupt` 不重试直接传播）
 
-![运行1](images\运行1.png)
+<img src="images/运行1.png" width="80%">
 
 **信息采集**
 
@@ -122,9 +124,8 @@ AI 驱动的竞品分析多 Agent 协作系统。
 - Mermaid 流程图（关键流程可视化）
 - 内联引用列表与来源回溯
 
-![结构化看板1](images\结构化看板1.png)
-
-![分析报告1](images\分析报告1.png)
+<img src="images/结构化看板1.png" width="80%">
+<img src="images/分析报告1.png" width="80%">
 
 **质量审查**
 
@@ -139,7 +140,7 @@ AI 驱动的竞品分析多 Agent 协作系统。
 - 6 种决策动作：jump / approve / abort / drop_competitor / keep_with_insufficient_evidence / replace_competitor
 - 支持崩溃恢复（`/recover` 端点，从 LangGraph Checkpoint 恢复僵尸工作流）
 
-![暂停](images\暂停.png)
+<img src="images/暂停.png" width="80%">
 
 **可观测性**
 
